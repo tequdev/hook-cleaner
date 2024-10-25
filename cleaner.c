@@ -6,7 +6,7 @@
 #include <stdlib.h>
 
 #define VERSION "1.1"
-#define DEBUG 1
+#define DEBUG 0
 #define DEBUG_VERBOSE 0
 
 #define MAX_TYPES 256
