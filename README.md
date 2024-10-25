@@ -4,6 +4,19 @@ Hook Cleaner removes unwanted compiler-provided exports and functions from a was
 ## WIP
 This project is still being debugged
 
+## Install
+
+```bash
+brew tap tequdev/tap
+brew install tequdev/tap/hook-cleaner
+```
+
+## Use
+
+```bash
+hook-cleaner accept.wasm
+```
+
 ## Requirements
 None, as long as you have any version of
 * gcc
@@ -18,7 +31,4 @@ cd hook-cleaner-c
 make
 ```
 
-## Use
-```bash
-./hook-cleaner accept.wasm
-```
+
