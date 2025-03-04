@@ -11,6 +11,7 @@
 
 #define MAX_TYPES 256
 #define MAX_FUNCS 256   /* this includes imports! */
+#define MAX_EXPORT_FUNCS 32  /* maximum number of allowed export functions */
 
 uint64_t leb(
     uint8_t** buf,
@@ -165,6 +166,17 @@ int cleaner (
     int func_hook = -1;
     int func_cbak = -1;
     int mem_export = -1; // RH UPTO: find out what memory is exported and carry it over (do we need this??)
+
+    // Structure to track export functions
+    struct export_func {
+        int idx;                    // Function index
+        char name[32];              // Export name
+        int name_len;               // Export name length
+        int valid;                  // Is this a valid entry
+    };
+
+    struct export_func export_funcs[MAX_EXPORT_FUNCS]; // Array to store export functions
+    int export_func_count = 0;      // Count of export functions
    
     int     out_import_count = -1;  // the number of imports there will be in the output file
     ssize_t out_import_size = 0;    // the size ofthe import section in the output
@@ -372,47 +384,137 @@ int cleaner (
                 uint8_t* export_end = w + section_len; 
     
                 uint64_t export_count = LEB();
+                
+                // Reset export function count
+                export_func_count = 0;
             
                 for (uint64_t i = 0; i < export_count; ++i)
                 {
-                    // we only care about two exports: hook and cbak
-                    // since we have to parse name first we'll read it in passing
-                    // and store info about it here
-                    int status = 0; // 1 = hook() 2 = cbak(), 0 = irrelevant
-                    
                     // read export name
                     uint64_t export_name_len = LEB();
                     REQUIRE(export_name_len);
-                    if (export_name_len == 4)
-                    {
-                        if (w[0] == 'h' && w[1] == 'o' && w[2] == 'o' && w[3] == 'k')
-                            status = 1;
-                        else
-                        if (w[0] == 'c' && w[1] == 'b' && w[2] == 'a' && w[3] == 'k')
-                            status = 2;
-                    }
-                    ADVANCE(export_name_len);
                     
-                    // export type
-                    REQUIRE(1);
-                    uint8_t export_type = w[0];
-                    ADVANCE(1);
+                    #define IS_HOOK() (w[0] == 'h' && w[1] == 'o' && w[2] == 'o' && w[3] == 'k')
+                    #define IS_CBK() (w[0] == 'c' && w[1] == 'b' && w[2] == 'a' && w[3] == 'k')
+                    
+                    // Check if this is a function we need to track
+                    if (export_name_len == 4 && (IS_HOOK() || IS_CBK()))
+                    {
+                        // This is the hook function
+                        ADVANCE(export_name_len);
+                        
+                        // export type
+                        REQUIRE(1);
+                        uint8_t export_type = w[0];
+                        ADVANCE(1);
+ 
+                        // Only process function exports
+                        if (export_type == 0x00U)
+                        {
+                            // export idx
+                            uint64_t export_idx = LEB();
 
-                    // export idx
-                    uint64_t export_idx = LEB();
-
-                    if (status == 1)
-                        func_hook = export_idx;
-                    else if (status == 2)
-                        func_cbak = export_idx;
-
-                    if (func_hook > -1 && func_cbak > -1)
-                        break;
+                            if(IS_HOOK())
+                                func_hook = export_idx;
+                            else if(IS_CBK())
+                                func_cbak = export_idx;
+                        }
+                        else
+                        {
+                            ADVANCE(1); // Skip non-function exports
+                        }
+                    }
+                    else if (export_func_count < MAX_EXPORT_FUNCS)
+                    {
+                        // Check if the export name starts with "__" (skip these)
+                        int skip_export = (export_name_len >= 2 && w[0] == '_' && w[1] == '_');
+                        
+                        if (skip_export) {
+                            // Skip "__" prefixed exports
+                            ADVANCE(export_name_len);
+                            
+                            // Skip export type
+                            REQUIRE(1);
+                            ADVANCE(1);
+                            
+                            // Skip export idx
+                            LEB();
+                            
+                            if (DEBUG)
+                                fprintf(stderr, "Skipping __ prefixed export function\n");
+                        }
+                        // Track other export functions
+                        else if (export_name_len < sizeof(export_funcs[export_func_count].name))
+                        {
+                            // Copy the export name
+                            for(int i = 0; i < export_name_len; i++)
+                            {
+                                fprintf(stderr, "export_funcs: %c\n", w[i]);
+                            }
+                            memcpy(export_funcs[export_func_count].name, w, export_name_len);
+                            export_funcs[export_func_count].name_len = export_name_len;
+                            
+                            ADVANCE(export_name_len);
+                            
+                            // export type
+                            REQUIRE(1);
+                            uint8_t export_type = w[0];
+                            ADVANCE(1);
+                            
+                            // Only process function exports
+                            if (export_type == 0x00U)
+                            {
+                                // export idx
+                                uint64_t export_idx = LEB();
+                                export_funcs[export_func_count].idx = export_idx;
+                                export_funcs[export_func_count].valid = 1;
+                                export_func_count++;
+                                
+                                if (DEBUG)
+                                    fprintf(stderr, "Added export function: %.*s (idx=%lld)\n",
+                                        export_funcs[export_func_count-1].name_len,
+                                        export_funcs[export_func_count-1].name,
+                                        (long long)export_idx);
+                            }
+                            else
+                            {
+                                ADVANCE(1); // Skip non-function exports
+                            }
+                        }
+                        else
+                        {
+                            // Name too long, error out
+                            return fprintf(stderr, "Export name too long: %.*s (max length is %lu)\n",
+                                (int)export_name_len, w, sizeof(export_funcs[export_func_count].name) - 1);
+                        }
+                    }
+                    else
+                    {
+                        // Reached maximum number of export functions, error out
+                        return fprintf(stderr, "Maximum number of export functions reached (%d). Cannot process additional export functions.\n",
+                            MAX_EXPORT_FUNCS);
+                    }
+                    // for(int i = 0; i < export_func_count; i++)
+                    // {
+                    //     fprintf(stderr, "export_funcs: %s\n", export_funcs[i].name);
+                    // }
                 }
 
-                // hook() is required at minimum
-                if (func_hook < 0)
-                    return fprintf(stderr, "Could not find hook() export in wasm input\n");
+                // Log found hook/cbak status
+                if (func_hook < 0 && DEBUG)
+                    fprintf(stderr, "No hook() export found in wasm input\n");
+
+                // Log found exports
+                if (DEBUG)
+                {
+                    fprintf(stderr, "Found exports: hook=%d, cbak=%d, others=%d\n",
+                        func_hook, func_cbak, export_func_count);
+                    for (int i = 0; i < export_func_count; i++)
+                    {
+                        fprintf(stderr, "  Export %d: %.*s (idx=%d)\n",
+                            i, export_funcs[i].name_len, export_funcs[i].name, export_funcs[i].idx);
+                    }
+                }
 
                 w = export_end;
 
@@ -429,9 +531,23 @@ int cleaner (
 
                     ADVANCE(code_size);
 
+                    // Check if this is hook or cbak function
                     if (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count))
+                    {
                         out_code_size += (w - code_start);
-    
+                    }
+                    else
+                    {
+                        // Check if this is one of our tracked export functions
+                        for (int e = 0; e < export_func_count; e++)
+                        {
+                            if (export_funcs[e].valid && i == (export_funcs[e].idx - out_import_count))
+                            {
+                                out_code_size += (w - code_start);
+                                break;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -721,7 +837,18 @@ int cleaner (
                 *o++ = 0x03U;
                 
 
-                ssize_t s = (func_cbak == -1 ? 0x01U : 0x02U);
+                // Calculate total number of functions in output
+                int func_count_out = 0;
+                if (func_hook != -1)
+                    func_count_out++;
+                if (func_cbak != -1)
+                    func_count_out++;
+                
+                // Add other exported functions
+                func_count_out += export_func_count;
+                
+                // Calculate section size
+                ssize_t s = func_count_out;
                 if (hook_cbak_type > 127U*127U)
                     return fprintf(stderr, "Illegally large hook_cbak type index\n");
                 if (hook_cbak_type > 127U)
@@ -732,14 +859,38 @@ int cleaner (
 
                 leb_out(s, &o); // sections size
                 uint8_t* function_start = o;
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U);   // vector size
-                leb_out(hook_cbak_type, &o);    // vector entries
+                *o++ = func_count_out;   // vector size
+                
+                // Write hook function type if exists
+                if (func_hook != -1)
+                {
+                    leb_out(hook_cbak_type, &o);
+                    if (DEBUG)
+                        fprintf(stderr, "Writing hook [idx=%d, type=%d]\n", func_hook, hook_cbak_type);
+                }
+                
+                // Write cbak function type if exists
                 if (func_cbak != -1)
                 {
                     leb_out(hook_cbak_type, &o);
                     if (DEBUG)
                         fprintf(stderr, "Writing cbak [idx=%d, type=%d]\n", func_cbak, hook_cbak_type);
                 }
+                
+                // Write other exported function types
+                for (int i = 0; i < export_func_count; i++)
+                {
+                    if (export_funcs[i].valid)
+                    {
+                        // Use the same type as hook/cbak for all exported functions
+                        leb_out(hook_cbak_type, &o);
+                        if (DEBUG)
+                            fprintf(stderr, "Writing export func %.*s [idx=%d, type=%d]\n",
+                                export_funcs[i].name_len, export_funcs[i].name,
+                                export_funcs[i].idx, hook_cbak_type);
+                    }
+                }
+                
                 ADVANCE(section_len);
 
                 if (DEBUG)
@@ -762,40 +913,83 @@ int cleaner (
             {
                 *o++ = 0x07U;
                 
-                // size
-                // V M NNNN 0 1 [ M NNNN 0 2 ]
-                *o++ = (func_cbak == -1 ? 0x08U : 0x0FU);
+                // Calculate total export count
+                int export_count_out = 0;
+                if (func_hook != -1)
+                    export_count_out++;
+                if (func_cbak != -1)
+                    export_count_out++;
+                export_count_out += export_func_count;
+                
+                // Calculate size for export section based on hook, cbak, and additional exports
+                // Each export: name length + name + type(0x00) + function index
+                int section_size = 0;
+                
+                // Size for vector length encoding
+                section_size += (export_count_out > 127 ? 2 : 1);
+                
+                // Size for hook export
+                if (func_hook != -1)
+                    section_size += 1 + 4 + 1 + (out_import_count > 127 ? 2 : 1); // 1(length) + 4("hook") + 1(type) + func index
 
-                // vec len
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U);
-    
-                int cbak_first = (func_cbak < func_hook);
-
-                if (cbak_first && func_cbak != -1)
-                {
-                    *o++ = 0x04U;
-                    *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
-                    *o++ = 0x00U;
-                    leb_out(out_import_count + 0, &o);
-                    
-                    *o++ = 0x04U;
-                    *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
-                    *o++ = 0x00U;
-                    leb_out(out_import_count + 1, &o);
+                // Size for cbak export if present
+                if (func_cbak != -1)
+                    section_size += 1 + 4 + 1 + (out_import_count > 127 ? 2 : 1); // 1(length) + 4("cbak") + 1(type) + func index
+                
+                // Size for additional exports
+                for (int i = 0; i < export_func_count; i++) {
+                    if (export_funcs[i].valid) {
+                        section_size += 1 + export_funcs[i].name_len + 1 + (out_import_count > 127 ? 2 : 1);
+                    }
                 }
-                else
-                {
-                    *o++ = 0x04U;
+                
+                // Write export section size
+                leb_out(section_size, &o);
+                
+                // Write export vector length
+                leb_out(export_count_out, &o);
+                
+                // Write exports
+                int func_index = 0;
+                
+                // Write hook export if exists
+                if (func_hook != -1) {
+                    *o++ = 0x04U; // name length
                     *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
-                    *o++ = 0x00U;
-                    leb_out(out_import_count + 0, &o);
+                    *o++ = 0x00U; // function export type
+                    leb_out(out_import_count + func_index++, &o);
+                }
 
-                    if (func_cbak != -1)
-                    {
-                        *o++ = 0x04U;
-                        *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
+                // Write cbak export if exists
+                if (func_cbak != -1) {
+                    *o++ = 0x04U; // name length
+                    *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
+                    *o++ = 0x00U; // function export type
+                    leb_out(out_import_count + func_index++, &o);
+                }
+                
+                // Write additional exports
+                for (int i = 0; i < export_func_count; i++) {
+                    if (export_funcs[i].valid) {
+                        // Write name length
+                        leb_out(export_funcs[i].name_len, &o);
+                        
+                        // Write name
+                        for (int j = 0; j < export_funcs[i].name_len; j++) {
+                            *o++ = export_funcs[i].name[j];
+                        }
+                        
+                        // Write export type (0x00 for function)
                         *o++ = 0x00U;
-                        leb_out(out_import_count + 1, &o);
+                        
+                        // Write function index
+                        leb_out(out_import_count + func_index++, &o);
+                        
+                        if (DEBUG) {
+                            fprintf(stderr, "Added export %.*s at index %d\n",
+                                export_funcs[i].name_len, export_funcs[i].name,
+                                out_import_count + func_index - 1);
+                        }
                     }
                 }
 
@@ -821,20 +1015,40 @@ int cleaner (
                 uint8_t* codesec_out_size_ptr = o;
 
 
+                // Calculate total number of functions in output
+                int func_count_out = 0; // hook is always required
+                if (func_hook != -1)
+                    func_count_out++;
+                if (func_cbak != -1)
+                    func_count_out++;
+                func_count_out += export_func_count;
 
                 // we need to correct this at the end
                 leb_out_pad(out_code_size + 1 /* allow for vec len */, &o, 3);
 
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U); // vec len
+                // Write function body count
+                leb_out(func_count_out, &o); // vec len
 
                 uint64_t count = LEB();
                 for (uint64_t i = 0; i < count; ++i)
                 {
                     uint8_t* code_start = w;
                     uint64_t code_size = LEB();
-                    if (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count))
-                    {
+                    // Check if this is hook, cbak, or other exported function
+                    int is_exported_func = (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count));
 
+                    // Check other export functions
+                    if (!is_exported_func) {
+                        for (int e = 0; e < export_func_count; e++) {
+                            if (export_funcs[e].valid && i == (export_funcs[e].idx - out_import_count)) {
+                                is_exported_func = 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (is_exported_func)
+                    {
                         //leb_out(code_size, &o);
                         int guard_rewrite_bytes = 0;
                         uint8_t* code_size_ptr = o;
@@ -1435,7 +1649,7 @@ int print_help(int argc, char** argv)
             "Hook Cleaner v" VERSION ". Richard Holland / XRPL-Labs 26/04/2022.\n"
             "Usage: %s in.wasm [out.wasm]\n"
             "Notes: If out.wasm is omitted then in.wasm is replaced.\n"
-            "       Strips all functions and exports except cbak() and hook().\n"
+            "       Preserves all exported functions including hook() and cbak() if they exist.\n"
             "       Also strips custom sections.\n"
             "       Specify - for stdin/out.\n", argv[0]);
     return 1;
