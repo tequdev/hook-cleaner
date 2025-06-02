@@ -400,6 +400,8 @@ int cleaner (
                     // Check if this is a function we need to track
                     if (export_name_len == 4 && (IS_HOOK() || IS_CBK()))
                     {
+                        int is_hook = IS_HOOK();
+                        int is_cbak = IS_CBK();
                         // This is the hook function
                         ADVANCE(export_name_len);
                         
@@ -414,9 +416,9 @@ int cleaner (
                             // export idx
                             uint64_t export_idx = LEB();
 
-                            if(IS_HOOK())
+                            if(is_hook)
                                 func_hook = export_idx;
-                            else if(IS_CBK())
+                            else if(is_cbak)
                                 func_cbak = export_idx;
                         }
                         else
