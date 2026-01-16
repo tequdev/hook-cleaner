@@ -193,6 +193,11 @@ int cleaner (
     int func_to_delete[MAX_FUNCS];   // 1 = delete this function, 0 = keep
     int func_new_idx[MAX_FUNCS];     // mapping from old index to new index
     int deleted_func_count = 0;       // number of deleted functions (non-import only)
+    
+    // Type elimination: track unused types
+    int type_used[MAX_TYPES];        // 1 = type is used, 0 = can be deleted
+    int type_new_idx[MAX_TYPES];     // mapping from old type index to new type index
+    int type_count = 0;
     struct {
         uint8_t set;
         uint8_t rc;
@@ -205,6 +210,8 @@ int cleaner (
     {
         func_type[x] = -1;
         types[x].set = 0;
+        type_used[x] = 0;
+        type_new_idx[x] = x;  // initially identity mapping
     }
     
     for (int x = 0; x < MAX_FUNCS; ++x)
@@ -242,7 +249,7 @@ int cleaner (
         {
             case 0x01U: // types
             {
-                int type_count = LEB();
+                type_count = LEB();
                 for (int i = 0; i < type_count; ++i)
                 {
                     REQUIRE(1);
@@ -525,6 +532,34 @@ int cleaner (
         fprintf(stderr, "After remapping: hook idx: %d, cbak idx: %d, deleted: %d\n", 
                 func_hook, func_cbak, deleted_func_count);
 
+    // Build type usage map - mark types used by non-deleted functions
+    for (int i = 0; i < out_import_count + func_count; ++i)
+    {
+        if (i >= out_import_count && func_to_delete[i])
+            continue;  // skip deleted functions
+        int t = func_type[i];
+        if (t >= 0 && t < MAX_TYPES)
+            type_used[t] = 1;
+    }
+    
+    // Build type remapping table
+    int new_type_idx = 0;
+    int out_type_count = 0;
+    for (int i = 0; i < type_count; ++i)
+    {
+        if (type_used[i])
+        {
+            type_new_idx[i] = new_type_idx++;
+            out_type_count++;
+        }
+        else
+        {
+            type_new_idx[i] = -1;  // mark as deleted
+            if (DEBUG)
+                fprintf(stderr, "Deleting unused type %d\n", i);
+        }
+    }
+    
     // Adjust out_code_size by subtracting deleted function code sizes
     // (will be calculated in pass 2)
     int out_func_count = func_count - deleted_func_count;
@@ -597,12 +632,35 @@ int cleaner (
 
             case 0x01U: // type section
             {
-                // copy type section as-is (preserve all types for helper functions)
+                // output type section, skipping unused types
                 *o++ = 0x01U;
-                leb_out(section_len, &o);
-                memcpy(o, w, section_len);
-                o += section_len;
-                ADVANCE(section_len);
+                
+                uint8_t temp_buf[4096];
+                uint8_t* temp = temp_buf;
+                leb_out(out_type_count, &temp);
+                
+                int input_type_count = LEB();
+                for (int i = 0; i < input_type_count; ++i)
+                {
+                    uint8_t* type_start = w;
+                    REQUIRE(1);
+                    ADVANCE(1);  // 0x60
+                    int pc = LEB();  // param count
+                    for (int j = 0; j < pc; ++j) LEB();
+                    int rc = LEB();  // result count
+                    for (int j = 0; j < rc; ++j) LEB();
+                    
+                    if (type_used[i])
+                    {
+                        memcpy(temp, type_start, w - type_start);
+                        temp += (w - type_start);
+                    }
+                }
+                
+                ssize_t type_section_size = temp - temp_buf;
+                leb_out(type_section_size, &o);
+                memcpy(o, temp_buf, type_section_size);
+                o += type_section_size;
                 continue;
             }
 
@@ -685,11 +743,12 @@ int cleaner (
                     // write import type (always 0)
                     *o++ = 0x00U;
 
+                    // remap type index
+                    int new_type = type_new_idx[func_type[func_import_idx]];
                     if (DEBUG)
-                        fprintf(stderr, "New import: %d type: %d\n", func_import_idx, func_type[func_import_idx]);
+                        fprintf(stderr, "New import: %d type: %d -> %d\n", func_import_idx, func_type[func_import_idx], new_type);
 
-                    // write original type idx (no remapping since we preserve all types)
-                    leb_out(func_type[func_import_idx], &o);
+                    leb_out(new_type, &o);
                     func_import_idx++;
 
                     LEB(); // discard old type
@@ -704,7 +763,7 @@ int cleaner (
 
             case 0x03U: // functions
             {
-                // output function section, skipping deleted functions
+                // output function section, skipping deleted functions and remapping type indices
                 *o++ = 0x03U;
                 
                 uint64_t input_func_count = LEB();
@@ -721,7 +780,9 @@ int cleaner (
                     
                     if (!func_to_delete[func_idx])
                     {
-                        leb_out(type_idx, &temp);
+                        // remap type index
+                        int new_type = type_new_idx[type_idx];
+                        leb_out(new_type, &temp);
                     }
                 }
                 
