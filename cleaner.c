@@ -433,8 +433,8 @@ int cleaner (
 
                     ADVANCE(code_size);
 
-                    if (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count))
-                        out_code_size += (w - code_start);
+                    // include all functions (not just hook/cbak) to preserve helper functions
+                    out_code_size += (w - code_start);
     
                 }
                 continue;
@@ -474,8 +474,7 @@ int cleaner (
     for (int i = 0; i < 8; ++i)
         *o++ = *w++;
 
-    int type_new[MAX_TYPES];
-    memset(type_new, 0, sizeof(type_new));
+    // type_new array removed - no longer remapping types
 
     next_section_start = 0;
 
@@ -529,100 +528,12 @@ int cleaner (
 
             case 0x01U: // type section
             {
+                // copy type section as-is (preserve all types for helper functions)
+                *o++ = 0x01U;
+                leb_out(section_len, &o);
+                memcpy(o, w, section_len);
+                o += section_len;
                 ADVANCE(section_len);
-
-                *o++ = 0x01U;   // write section type
-
-                uint8_t used[MAX_TYPES];
-                memset(used, 0, MAX_TYPES);
-
-                // count types
-                int type_count = 0;
-                int imports_use_hook_cbak_type = 0;
-                int section_size = 0;
-                for (int i = 0; i < out_import_count; ++i)
-                {
-                    if (!used[func_type[i]])
-                    {
-                        type_count++;
-                        used[func_type[i]] = 1;
-                        section_size += 3U + types[func_type[i]].rc + types[func_type[i]].pc;
-                        if (func_type[i] == hook_cbak_type && !imports_use_hook_cbak_type)
-                        {
-                            imports_use_hook_cbak_type = 1;
-                            hook_cbak_type = type_count-1;
-                            if (DEBUG)
-                                fprintf(stderr, "Imports DO use hook_cbak_type = %d\n", hook_cbak_type);
-                        }
-                    }
-                }
-                
-                if (!imports_use_hook_cbak_type)
-                {
-                    hook_cbak_type = type_count++;
-                    section_size += 5U;
-                    if (DEBUG)
-                        fprintf(stderr, "Imports do not use hook_cbak_type = %d\n", hook_cbak_type);
-                }
-                
-                if (type_count > 127*127)
-                    return fprintf(stderr, "Too many types in wasm!\n");
-
-                // account for the type vector size bytes
-                section_size += (type_count > 127 ? 2U : 1U);
-
-                if (DEBUG)
-                    fprintf(stderr, "Writing type section, proposed size: %d\n", section_size);
-                // write out section size
-                leb_out(section_size, &o);
-
-
-                uint8_t* out_start = o;
-
-                // write type vector len
-                leb_out(type_count, &o);
-
-                // write out types
-                memset(used, 0, MAX_TYPES);
-                int upto = 0;
-                for (int i = 0; i < out_import_count; ++i)
-                {
-                    int t = func_type[i];
-                    if (!types[t].set)
-                        return fprintf(stderr, "Tried to write unset type %d from func %d\n", func_type[i], i);
-                    
-
-                    if (used[t])
-                        continue;
-                    used[t] = 1;
-
-                    *o++ = 0x60U;   // functype lead in byte
-                    // write parameter count
-                    leb_out(types[t].pc, &o);
-                    // write each parameter type
-                    for (int j = 0; j < types[t].pc; ++j)
-                        leb_out(types[t].p[j], &o);
-                
-                    leb_out(types[t].rc, &o);
-                    for (int j = 0; j < types[t].rc; ++j)
-                        leb_out(types[t].r[j], &o);
-
-                    type_new[t] = upto++;
-                    // done for this record
-                }
-
-                // write out cbak/hook type if needed
-                if (!imports_use_hook_cbak_type)
-                {
-                    *o++ = 0x60U;
-                    *o++ = 0x01U;
-                    *o++ = 0x7FU;
-                    *o++ = 0x01U;
-                    *o++ = 0x7EU;
-                }
-
-                if (DEBUG)
-                    fprintf(stderr, "Actually written type section size: %ld\n", o - out_start);
                 continue;
             }
 
@@ -640,7 +551,7 @@ int cleaner (
                 uint8_t* import_start = o;
                 leb_out(out_import_count, &o);
 
-                int type_count = 0;
+                int func_import_idx = 0;
                 
                 int count = LEB();
                 for (int i = 0; i < count; ++i)
@@ -706,10 +617,11 @@ int cleaner (
                     *o++ = 0x00U;
 
                     if (DEBUG)
-                        fprintf(stderr, "New import: %d old type: %d new type: %d\n", i, func_type[i], type_new[func_type[i]]);
+                        fprintf(stderr, "New import: %d type: %d\n", func_import_idx, func_type[func_import_idx]);
 
-                    // write new type idx
-                    leb_out(type_new[func_type[i]], &o);
+                    // write original type idx (no remapping since we preserve all types)
+                    leb_out(func_type[func_import_idx], &o);
+                    func_import_idx++;
 
                     LEB(); // discard old type
                     // advance to next entry
@@ -723,32 +635,12 @@ int cleaner (
 
             case 0x03U: // functions
             {
+                // copy function section as-is (preserve all functions for helper functions)
                 *o++ = 0x03U;
-                
-
-                ssize_t s = (func_cbak == -1 ? 0x01U : 0x02U);
-                if (hook_cbak_type > 127U*127U)
-                    return fprintf(stderr, "Illegally large hook_cbak type index\n");
-                if (hook_cbak_type > 127U)
-                    s <<= 1U;   // double size if > 127
-                s++;            // one byte for the vector size
-                if (DEBUG)
-                    fprintf(stderr, "Writing function section, proposed size: %ld\n", s);
-
-                leb_out(s, &o); // sections size
-                uint8_t* function_start = o;
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U);   // vector size
-                leb_out(hook_cbak_type, &o);    // vector entries
-                if (func_cbak != -1)
-                {
-                    leb_out(hook_cbak_type, &o);
-                    if (DEBUG)
-                        fprintf(stderr, "Writing cbak [idx=%d, type=%d]\n", func_cbak, hook_cbak_type);
-                }
+                leb_out(section_len, &o);
+                memcpy(o, w, section_len);
+                o += section_len;
                 ADVANCE(section_len);
-
-                if (DEBUG)
-                    fprintf(stderr, "Actually written function size: %ld\n", o - function_start);
                 continue;
             }
 
@@ -767,41 +659,34 @@ int cleaner (
             {
                 *o++ = 0x07U;
                 
-                // size
-                // V M NNNN 0 1 [ M NNNN 0 2 ]
-                *o++ = (func_cbak == -1 ? 0x08U : 0x0FU);
+                // calculate section size dynamically (original func indices may be > 127)
+                // format: vec_len + (name_len + name + type + idx) * n
+                int hook_leb_size = (func_hook <= 127 ? 1 : (func_hook <= 16383 ? 2 : 3));
+                int cbak_leb_size = (func_cbak <= 127 ? 1 : (func_cbak <= 16383 ? 2 : 3));
+                
+                // vec_len(1) + hook_export(1+4+1+hook_leb) [+ cbak_export(1+4+1+cbak_leb)]
+                int export_section_size = 1 + 6 + hook_leb_size;
+                if (func_cbak != -1)
+                    export_section_size += 6 + cbak_leb_size;
+                
+                leb_out(export_section_size, &o);
 
                 // vec len
                 *o++ = (func_cbak == -1 ? 0x01U : 0x02U);
     
-                int cbak_first = (func_cbak < func_hook);
+                // write hook export (use original func_hook index)
+                *o++ = 0x04U;
+                *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
+                *o++ = 0x00U;
+                leb_out(func_hook, &o);
 
-                if (cbak_first && func_cbak != -1)
+                // write cbak export if present (use original func_cbak index)
+                if (func_cbak != -1)
                 {
                     *o++ = 0x04U;
                     *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
                     *o++ = 0x00U;
-                    leb_out(out_import_count + 0, &o);
-                    
-                    *o++ = 0x04U;
-                    *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
-                    *o++ = 0x00U;
-                    leb_out(out_import_count + 1, &o);
-                }
-                else
-                {
-                    *o++ = 0x04U;
-                    *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
-                    *o++ = 0x00U;
-                    leb_out(out_import_count + 0, &o);
-
-                    if (func_cbak != -1)
-                    {
-                        *o++ = 0x04U;
-                        *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
-                        *o++ = 0x00U;
-                        leb_out(out_import_count + 1, &o);
-                    }
+                    leb_out(func_cbak, &o);
                 }
 
                 ADVANCE(section_len);
@@ -812,8 +697,12 @@ int cleaner (
             {
                 *o++ = 0x0AU;
 
+                // calculate vec len LEB size for func_count
+                int vec_len_size = (func_count <= 127 ? 1 : (func_count <= 16383 ? 2 : 3));
+
                 if (DEBUG)
-                    fprintf(stderr, "Output code size: %ld\n", out_code_size + 1);
+                    fprintf(stderr, "Output code size: %ld (vec_len_size=%d, func_count=%d)\n", 
+                            out_code_size + vec_len_size, vec_len_size, func_count);
 
     
                 // RH NOTE:
@@ -828,16 +717,16 @@ int cleaner (
 
 
                 // we need to correct this at the end
-                leb_out_pad(out_code_size + 1 /* allow for vec len */, &o, 3);
+                leb_out_pad(out_code_size + vec_len_size /* allow for vec len */, &o, 3);
 
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U); // vec len
+                leb_out(func_count, &o); // vec len (all functions, not just hook/cbak)
 
                 uint64_t count = LEB();
                 for (uint64_t i = 0; i < count; ++i)
                 {
                     uint8_t* code_start = w;
                     uint64_t code_size = LEB();
-                    if (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count))
+                    // process all functions (not just hook/cbak) to preserve helper functions
                     {
 
                         //leb_out(code_size, &o);
@@ -1299,19 +1188,17 @@ int cleaner (
                         leb_out_pad(code_size + guard_rewrite_bytes, /* 1 byte for vec len */
                                 &code_size_ptr, 3);
                     }
-                    else
-                        ADVANCE(code_size);     // skip other functions
                 }
 
                 // rewrite the total size of the section
                 if (DEBUG)
                     fprintf(stderr, "Rewriting codesec section from: %ld to %ld at %ld [0x%lx] \n",
-                            out_code_size + 1,
-                            out_code_size + 1 + total_guard_rewrite_bytes,
+                            out_code_size + vec_len_size,
+                            out_code_size + vec_len_size + total_guard_rewrite_bytes,
                             out_code_size,
                             out_code_size);
 
-                leb_out_pad(out_code_size + total_guard_rewrite_bytes + 1, /* 1 byte for vec len */
+                leb_out_pad(out_code_size + total_guard_rewrite_bytes + vec_len_size, /* vec len size */
                         &codesec_out_size_ptr, 3);
                 continue;
             }
