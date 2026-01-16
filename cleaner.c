@@ -937,20 +937,28 @@ int cleaner (
 
                         int i32_found = 0;
                         uint8_t* call_guard_found = 0;
+                        uint8_t* call_guard_found_out = 0;
+                        uint8_t* call_guard_end_out = 0;
                         uint8_t* last_i32 = 0;
                         uint64_t last_i32_actual = 0;   // the actual leb value 
                         uint8_t* second_last_i32 = 0;
                         uint64_t second_last_i32_actual = 0; // the actual leb value
+                        uint8_t* last_i32_out = 0;
+                        uint8_t* second_last_i32_out = 0;
                         int between_const_and_guard = 0;
 
                         #define RESET_GUARD_FINDER()\
                         {\
                             i32_found = 0;\
                             call_guard_found = 0;\
+                            call_guard_found_out = 0;\
+                            call_guard_end_out = 0;\
                             last_i32 = 0;\
                             last_i32_actual = 0;\
                             second_last_i32 = 0;\
                             second_last_i32_actual = 0;\
+                            last_i32_out = 0;\
+                            second_last_i32_out = 0;\
                             between_const_and_guard = 0;\
                         }
 
@@ -1048,13 +1056,17 @@ int cleaner (
 
                                         // erase guard call with nops and an additional drop
                                         // to preserve the stack at this location during runtime
-                                        int bytes_to_fill = w - call_guard_found - 2;
-                                        *call_guard_found = 0x1AU;                      // drop
-                                        while (bytes_to_fill-- > 0)
-                                            *(++call_guard_found) = 0x01U;              // nop
+                                        if (call_guard_found_out && call_guard_end_out)
+                                        {
+                                            int bytes_to_fill = (int)(call_guard_end_out - call_guard_found_out) - 1;
+                                            *call_guard_found_out = 0x1AU;              // drop
+                                            while (bytes_to_fill-- > 0)
+                                                *(++call_guard_found_out) = 0x01U;      // nop
+                                        }
 
-                                        // first move the instructions down
-                                        memcpy(last_loop_out + guard_len, last_loop, rest_len);
+                                        // first move the existing output down
+                                        ssize_t out_tail_len = o - last_loop_out;
+                                        memmove(last_loop_out + guard_len, last_loop_out, out_tail_len);
 
                                         // then copy the guard into position
                                         memcpy(last_loop_out, guard_code, guard_len);
@@ -1070,8 +1082,8 @@ int cleaner (
                                     }
                                     else
                                     {
-                                        ssize_t guard_len = w - second_last_i32;
-                                        ssize_t rest_len = second_last_i32 - last_loop;
+                                        ssize_t guard_len = o - second_last_i32_out;
+                                        ssize_t rest_len = second_last_i32_out - last_loop_out;
                                         fprintf(stderr, "Found clean guard at: %ld [0x%lx] - %ld [0x%lx], "
                                                 "moving to %ld [0x%lx] - %ld [0x%lx]\n", 
                                                 second_last_i32 - wstart,
@@ -1084,11 +1096,17 @@ int cleaner (
                                                 last_loop - wstart + guard_len
                                             );
 
-                                        // first move the instructions down
-                                        memcpy(last_loop_out + guard_len, last_loop, rest_len);
+                                        uint8_t guard_code[128];
+                                        if (guard_len > (ssize_t)sizeof(guard_code))
+                                            return fprintf(stderr, "Guard sequence too large (%ld bytes)\n", guard_len);
+                                        
+                                        memcpy(guard_code, second_last_i32_out, guard_len);
+
+                                        // first move the existing output down
+                                        memmove(last_loop_out + guard_len, last_loop_out, rest_len);
 
                                         // then copy the guard into position
-                                        memcpy(last_loop_out, second_last_i32, guard_len);
+                                        memcpy(last_loop_out, guard_code, guard_len);
 
                                         // prevent moving a second guard here if somehow there is one
                                         last_loop = 0;
@@ -1102,12 +1120,40 @@ int cleaner (
                             {
                                 REQUIRE(1);
                                 uint8_t* ptr = w - 1;
+                                uint8_t* fptr = w;
                                 uint64_t f = LEB();
                                 
                                 // remap function index if it's a non-import function
                                 uint64_t new_f = f;
                                 if (f >= (uint64_t)out_import_count && f < MAX_FUNCS)
                                     new_f = func_new_idx[f];
+
+                                // Repair known corruption where a call index LEB has consumed a following opcode,
+                                // resulting in a huge function index (e.g. 524288) and an unreachable opcode.
+                                // This commonly corresponds to an original sequence:
+                                //   call _g; drop; local.get 0
+                                // being corrupted into:
+                                //   call 524288; unreachable
+                                // We rewrite it back to a valid, equivalent-length sequence.
+                                if (new_f >= (uint64_t)MAX_FUNCS &&
+                                    fptr + 3 <= wend &&
+                                    w < wend && w + 1 < wend &&
+                                    *w == 0x00U && *(w + 1) == 0x42U)
+                                {
+                                    // skip the unreachable opcode byte
+                                    ADVANCE(1);
+                                    new_f = (uint64_t)guard_func_idx;
+
+                                    // do not attempt to match/move this guard, just repair bytes and continue
+                                    RESET_GUARD_FINDER()
+
+                                    *o++ = 0x10U;
+                                    leb_out(new_f, &o);
+                                    *o++ = 0x1AU;          // drop
+                                    *o++ = 0x20U;          // local.get
+                                    *o++ = 0x00U;          // local 0
+                                    continue;
+                                }
                                 
                                 if (new_f != (uint64_t)guard_func_idx)
                                     RESET_GUARD_FINDER()
@@ -1120,8 +1166,14 @@ int cleaner (
                                 guard_rewrite_bytes += (new_leb - old_leb);
                                 
                                 // write call instruction with remapped index
+                                uint8_t* out_call_start = o;
                                 *o++ = 0x10U;
                                 leb_out(new_f, &o);
+                                if (new_f == (uint64_t)guard_func_idx)
+                                {
+                                    call_guard_found_out = out_call_start;
+                                    call_guard_end_out = o;
+                                }
                                 continue;
                             } else                            
                             if (ins == 0x41U)                       // i32.const
@@ -1131,6 +1183,8 @@ int cleaner (
                                 last_i32 = w - 1;
 
                                 second_last_i32_actual = last_i32_actual;
+                                second_last_i32_out = last_i32_out;
+                                last_i32_out = o;
 
                                 last_i32_actual = LEB();
 
