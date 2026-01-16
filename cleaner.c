@@ -62,6 +62,17 @@ void leb_out(
 }
 
 
+// Calculate the size of a LEB128 encoding
+int leb_size(uint64_t val)
+{
+    int size = 0;
+    do {
+        size++;
+        val >>= 7;
+    } while (val != 0);
+    return size;
+}
+
 void leb_out_pad(
     uint64_t i,
     uint8_t** o,
@@ -177,6 +188,11 @@ int cleaner (
     int func_count = -1;
     int hook_cbak_type = -1;
     int func_type[MAX_FUNCS];    // each function we discover import/func has its type id recorded here
+    
+    // Dead code elimination: track functions to delete (exported with __ prefix)
+    int func_to_delete[MAX_FUNCS];   // 1 = delete this function, 0 = keep
+    int func_new_idx[MAX_FUNCS];     // mapping from old index to new index
+    int deleted_func_count = 0;       // number of deleted functions (non-import only)
     struct {
         uint8_t set;
         uint8_t rc;
@@ -189,6 +205,12 @@ int cleaner (
     {
         func_type[x] = -1;
         types[x].set = 0;
+    }
+    
+    for (int x = 0; x < MAX_FUNCS; ++x)
+    {
+        func_to_delete[x] = 0;
+        func_new_idx[x] = x;  // initially identity mapping
     }
 
     int guard_func_idx = -1;
@@ -383,6 +405,7 @@ int cleaner (
                     // since we have to parse name first we'll read it in passing
                     // and store info about it here
                     int status = 0; // 1 = hook() 2 = cbak(), 0 = irrelevant
+                    int is_dunder = 0; // 1 = starts with "__"
                     
                     // read export name
                     uint64_t export_name_len = LEB();
@@ -395,6 +418,11 @@ int cleaner (
                         if (w[0] == 'c' && w[1] == 'b' && w[2] == 'a' && w[3] == 'k')
                             status = 2;
                     }
+                    
+                    // check if name starts with "__" (dunder)
+                    if (export_name_len >= 2 && w[0] == '_' && w[1] == '_')
+                        is_dunder = 1;
+                    
                     ADVANCE(export_name_len);
                     
                     // export type
@@ -409,9 +437,16 @@ int cleaner (
                         func_hook = export_idx;
                     else if (status == 2)
                         func_cbak = export_idx;
-
-                    if (func_hook > -1 && func_cbak > -1)
-                        break;
+                    else if (is_dunder && export_type == 0x00U)
+                    {
+                        // function export starting with "__" - mark for deletion
+                        if (export_idx < MAX_FUNCS)
+                        {
+                            func_to_delete[export_idx] = 1;
+                            if (DEBUG)
+                                fprintf(stderr, "Marking func %ld for deletion (dunder export)\n", export_idx);
+                        }
+                    }
                 }
 
                 // hook() is required at minimum
@@ -459,6 +494,40 @@ int cleaner (
 
     if (guard_func_idx == -1)
         return fprintf(stderr, "Guard function _g was not imported / missing.\n");
+
+    // Build remapping table for function indices
+    // Only non-import functions can be deleted
+    int new_idx = out_import_count;
+    for (int i = out_import_count; i < out_import_count + func_count; ++i)
+    {
+        if (func_to_delete[i])
+        {
+            func_new_idx[i] = -1;  // mark as deleted
+            deleted_func_count++;
+            if (DEBUG)
+                fprintf(stderr, "Deleting func %d\n", i);
+        }
+        else
+        {
+            func_new_idx[i] = new_idx++;
+            if (DEBUG)
+                fprintf(stderr, "Remapping func %d -> %d\n", i, func_new_idx[i]);
+        }
+    }
+    
+    // Remap hook and cbak indices
+    if (func_hook >= out_import_count)
+        func_hook = func_new_idx[func_hook];
+    if (func_cbak >= out_import_count)
+        func_cbak = func_new_idx[func_cbak];
+    
+    if (DEBUG)
+        fprintf(stderr, "After remapping: hook idx: %d, cbak idx: %d, deleted: %d\n", 
+                func_hook, func_cbak, deleted_func_count);
+
+    // Adjust out_code_size by subtracting deleted function code sizes
+    // (will be calculated in pass 2)
+    int out_func_count = func_count - deleted_func_count;
 
     // reset to top
     w = wstart;
@@ -635,12 +704,32 @@ int cleaner (
 
             case 0x03U: // functions
             {
-                // copy function section as-is (preserve all functions for helper functions)
+                // output function section, skipping deleted functions
                 *o++ = 0x03U;
-                leb_out(section_len, &o);
-                memcpy(o, w, section_len);
-                o += section_len;
-                ADVANCE(section_len);
+                
+                uint64_t input_func_count = LEB();
+                
+                // calculate output section size
+                uint8_t temp_buf[MAX_FUNCS * 3];  // worst case: 3 bytes per LEB
+                uint8_t* temp = temp_buf;
+                leb_out(out_func_count, &temp);
+                
+                for (uint64_t i = 0; i < input_func_count; ++i)
+                {
+                    int func_idx = out_import_count + i;
+                    uint64_t type_idx = LEB();
+                    
+                    if (!func_to_delete[func_idx])
+                    {
+                        leb_out(type_idx, &temp);
+                    }
+                }
+                
+                ssize_t func_section_size = temp - temp_buf;
+                leb_out(func_section_size, &o);
+                memcpy(o, temp_buf, func_section_size);
+                o += func_section_size;
+                
                 continue;
             }
 
@@ -697,12 +786,12 @@ int cleaner (
             {
                 *o++ = 0x0AU;
 
-                // calculate vec len LEB size for func_count
-                int vec_len_size = (func_count <= 127 ? 1 : (func_count <= 16383 ? 2 : 3));
+                // calculate vec len LEB size for out_func_count (after deletions)
+                int vec_len_size = (out_func_count <= 127 ? 1 : (out_func_count <= 16383 ? 2 : 3));
 
                 if (DEBUG)
-                    fprintf(stderr, "Output code size: %ld (vec_len_size=%d, func_count=%d)\n", 
-                            out_code_size + vec_len_size, vec_len_size, func_count);
+                    fprintf(stderr, "Output code size: %ld (vec_len_size=%d, out_func_count=%d)\n", 
+                            out_code_size + vec_len_size, vec_len_size, out_func_count);
 
     
                 // RH NOTE:
@@ -712,6 +801,8 @@ int cleaner (
                 // original size of the hook will be inserted at the start of the relevant loop. This counter tracks
                 // these, and the reserved space allows us to output the right LEB128 at the end.
                 int total_guard_rewrite_bytes = 0;
+                // Track bytes saved from deleted functions
+                int total_deleted_bytes = 0;
                 uint8_t* codesec_out_size_ptr = o;
 
 
@@ -719,14 +810,26 @@ int cleaner (
                 // we need to correct this at the end
                 leb_out_pad(out_code_size + vec_len_size /* allow for vec len */, &o, 3);
 
-                leb_out(func_count, &o); // vec len (all functions, not just hook/cbak)
+                leb_out(out_func_count, &o); // vec len (only non-deleted functions)
 
                 uint64_t count = LEB();
                 for (uint64_t i = 0; i < count; ++i)
                 {
+                    int func_idx = out_import_count + i;  // actual function index
                     uint8_t* code_start = w;
                     uint64_t code_size = LEB();
-                    // process all functions (not just hook/cbak) to preserve helper functions
+                    
+                    // skip deleted functions
+                    if (func_to_delete[func_idx])
+                    {
+                        total_deleted_bytes += (w - code_start) + code_size;
+                        ADVANCE(code_size);
+                        if (DEBUG)
+                            fprintf(stderr, "Skipping deleted func %d\n", func_idx);
+                        continue;
+                    }
+                    
+                    // process this function
                     {
 
                         //leb_out(code_size, &o);
@@ -939,12 +1042,25 @@ int cleaner (
                                 REQUIRE(1);
                                 uint8_t* ptr = w - 1;
                                 uint64_t f = LEB();
-                                if (f != guard_func_idx)
+                                
+                                // remap function index if it's a non-import function
+                                uint64_t new_f = f;
+                                if (f >= (uint64_t)out_import_count && f < MAX_FUNCS)
+                                    new_f = func_new_idx[f];
+                                
+                                if (new_f != (uint64_t)guard_func_idx)
                                     RESET_GUARD_FINDER()
                                 else
                                     call_guard_found = ptr;
-                                memcpy(o, instr_start, w-instr_start);
-                                o += (w - instr_start);
+                                
+                                // track size change due to remapping
+                                int old_leb = leb_size(f);
+                                int new_leb = leb_size(new_f);
+                                guard_rewrite_bytes += (new_leb - old_leb);
+                                
+                                // write call instruction with remapped index
+                                *o++ = 0x10U;
+                                leb_out(new_f, &o);
                                 continue;
                             } else                            
                             if (ins == 0x41U)                       // i32.const
@@ -1178,27 +1294,29 @@ int cleaner (
                             uint8_t* code_size_ptr = o;
                         */
 
+                        // Calculate actual written size for this function
+                        ssize_t actual_func_size = o - (code_size_ptr + 3);
+                        
                         if (DEBUG)
-                            fprintf(stderr, "Rewriting codesec from: %ld to %ld at %ld [0x%lx]\n",
+                            fprintf(stderr, "Rewriting func size from: %ld to %ld\n",
                                     code_size,
-                                    code_size + guard_rewrite_bytes,
-                                    code_size,
-                                    code_size);
+                                    actual_func_size);
 
-                        leb_out_pad(code_size + guard_rewrite_bytes, /* 1 byte for vec len */
+                        leb_out_pad(actual_func_size,
                                 &code_size_ptr, 3);
                     }
                 }
 
                 // rewrite the total size of the section
+                // calculate actual written size (from after the 3-byte padded LEB to current position)
+                ssize_t actual_code_size = o - (codesec_out_size_ptr + 3);
                 if (DEBUG)
-                    fprintf(stderr, "Rewriting codesec section from: %ld to %ld at %ld [0x%lx] \n",
-                            out_code_size + vec_len_size,
-                            out_code_size + vec_len_size + total_guard_rewrite_bytes,
-                            out_code_size,
-                            out_code_size);
+                    fprintf(stderr, "Rewriting codesec section: actual size = %ld (deleted: %d, guard_rewrite: %d)\n",
+                            actual_code_size,
+                            total_deleted_bytes,
+                            total_guard_rewrite_bytes);
 
-                leb_out_pad(out_code_size + total_guard_rewrite_bytes + vec_len_size, /* vec len size */
+                leb_out_pad(actual_code_size,
                         &codesec_out_size_ptr, 3);
                 continue;
             }
