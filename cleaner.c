@@ -652,11 +652,16 @@ int cleaner (
                     
                     if (type_used[i])
                     {
+                        // Check bounds before copying
+                        if (temp - temp_buf + (w - type_start) > (ssize_t)sizeof(temp_buf))
+                        {
+                            return fprintf(stderr, "Type section too large (>4KB)\n");
+                        }
                         memcpy(temp, type_start, w - type_start);
                         temp += (w - type_start);
                     }
                 }
-                
+
                 ssize_t type_section_size = temp - temp_buf;
                 leb_out(type_section_size, &o);
                 memcpy(o, temp_buf, type_section_size);
@@ -811,8 +816,8 @@ int cleaner (
                 
                 // calculate section size dynamically (original func indices may be > 127)
                 // format: vec_len + (name_len + name + type + idx) * n
-                int hook_leb_size = (func_hook <= 127 ? 1 : (func_hook <= 16383 ? 2 : 3));
-                int cbak_leb_size = (func_cbak <= 127 ? 1 : (func_cbak <= 16383 ? 2 : 3));
+                int hook_leb_size = leb_size(func_hook);
+                int cbak_leb_size = leb_size(func_cbak);
                 
                 // vec_len(1) + hook_export(1+4+1+hook_leb) [+ cbak_export(1+4+1+cbak_leb)]
                 int export_section_size = 1 + 6 + hook_leb_size;
@@ -1056,13 +1061,15 @@ int cleaner (
 
                                         // erase guard call with nops and an additional drop
                                         // to preserve the stack at this location during runtime
-                                        if (call_guard_found_out && call_guard_end_out)
+                                        if (!call_guard_found_out || !call_guard_end_out)
                                         {
-                                            int bytes_to_fill = (int)(call_guard_end_out - call_guard_found_out) - 1;
-                                            *call_guard_found_out = 0x1AU;              // drop
-                                            while (bytes_to_fill-- > 0)
-                                                *(++call_guard_found_out) = 0x01U;      // nop
+                                            return fprintf(stderr, "Guard erasure attempted without output tracking at offset %ld\n",
+                                                    w - wstart);
                                         }
+                                        int bytes_to_fill = (int)(call_guard_end_out - call_guard_found_out) - 1;
+                                        *call_guard_found_out = 0x1AU;              // drop
+                                        while (bytes_to_fill-- > 0)
+                                            *(++call_guard_found_out) = 0x01U;      // nop
 
                                         // first move the existing output down
                                         ssize_t out_tail_len = o - last_loop_out;
@@ -1126,7 +1133,15 @@ int cleaner (
                                 // remap function index if it's a non-import function
                                 uint64_t new_f = f;
                                 if (f >= (uint64_t)out_import_count && f < MAX_FUNCS)
+                                {
                                     new_f = func_new_idx[f];
+                                    // Check if the function was deleted
+                                    if (new_f == (uint64_t)-1)
+                                    {
+                                        return fprintf(stderr, "Call to deleted function %ld at offset %ld\n",
+                                                f, w - wstart);
+                                    }
+                                }
 
                                 // Repair known corruption where a call index LEB has consumed a following opcode,
                                 // resulting in a huge function index (e.g. 524288) and an unreachable opcode.
