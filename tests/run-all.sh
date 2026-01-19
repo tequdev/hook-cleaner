@@ -27,8 +27,8 @@ TOTALSAVED=0
 FAILED=0
 for i in `ls *.wasm`; do
     COUNT=`expr $COUNT + 1`
-    rm /tmp/t.wasm
-    rm /tmp/t.wat
+    rm -f /tmp/t.wasm
+    rm -f /tmp/t.wat
     $HOOKCLEANER $i /tmp/t.wasm > /dev/null 2> /dev/null
     R1="$?"
     wasm2wat /tmp/t.wasm > /dev/null 2> /dev/null
