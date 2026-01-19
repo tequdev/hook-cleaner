@@ -412,8 +412,7 @@ int cleaner (
                     // since we have to parse name first we'll read it in passing
                     // and store info about it here
                     int status = 0; // 1 = hook() 2 = cbak(), 0 = irrelevant
-                    int is_dunder = 0; // 1 = starts with "__"
-                    
+
                     // read export name
                     uint64_t export_name_len = LEB();
                     REQUIRE(export_name_len);
@@ -425,11 +424,7 @@ int cleaner (
                         if (w[0] == 'c' && w[1] == 'b' && w[2] == 'a' && w[3] == 'k')
                             status = 2;
                     }
-                    
-                    // check if name starts with "__" (dunder)
-                    if (export_name_len >= 2 && w[0] == '_' && w[1] == '_')
-                        is_dunder = 1;
-                    
+
                     ADVANCE(export_name_len);
                     
                     // export type
@@ -444,14 +439,14 @@ int cleaner (
                         func_hook = export_idx;
                     else if (status == 2)
                         func_cbak = export_idx;
-                    else if (is_dunder && export_type == 0x00U)
+                    else if (status == 0 && export_type == 0x00U)
                     {
-                        // function export starting with "__" - mark for deletion
+                        // function export that is not hook/cbak - mark for deletion
                         if (export_idx < MAX_FUNCS)
                         {
                             func_to_delete[export_idx] = 1;
                             if (DEBUG)
-                                fprintf(stderr, "Marking func %ld for deletion (dunder export)\n", export_idx);
+                                fprintf(stderr, "Marking func %ld for deletion (non-hook/cbak export)\n", export_idx);
                         }
                     }
                 }
