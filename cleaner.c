@@ -1138,33 +1138,6 @@ int cleaner (
                                     }
                                 }
 
-                                // Repair known corruption where a call index LEB has consumed a following opcode,
-                                // resulting in a huge function index (e.g. 524288) and an unreachable opcode.
-                                // This commonly corresponds to an original sequence:
-                                //   call _g; drop; local.get 0
-                                // being corrupted into:
-                                //   call 524288; unreachable
-                                // We rewrite it back to a valid, equivalent-length sequence.
-                                if (new_f >= (uint64_t)MAX_FUNCS &&
-                                    fptr + 3 <= wend &&
-                                    w < wend && w + 1 < wend &&
-                                    *w == 0x00U && *(w + 1) == 0x42U)
-                                {
-                                    // skip the unreachable opcode byte
-                                    ADVANCE(1);
-                                    new_f = (uint64_t)guard_func_idx;
-
-                                    // do not attempt to match/move this guard, just repair bytes and continue
-                                    RESET_GUARD_FINDER()
-
-                                    *o++ = 0x10U;
-                                    leb_out(new_f, &o);
-                                    *o++ = 0x1AU;          // drop
-                                    *o++ = 0x20U;          // local.get
-                                    *o++ = 0x00U;          // local 0
-                                    continue;
-                                }
-                                
                                 if (new_f != (uint64_t)guard_func_idx)
                                     RESET_GUARD_FINDER()
                                 else
