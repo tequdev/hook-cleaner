@@ -527,31 +527,33 @@ int cleaner (
         fprintf(stderr, "After remapping: hook idx: %d, cbak idx: %d, deleted: %d\n", 
                 func_hook, func_cbak, deleted_func_count);
 
-    // Build type usage map - mark types used by non-deleted functions
-    for (int i = 0; i < out_import_count + func_count; ++i)
-    {
-        if (i >= out_import_count && func_to_delete[i])
-            continue;  // skip deleted functions
-        int t = func_type[i];
-        if (t >= 0 && t < MAX_TYPES)
-            type_used[t] = 1;
-    }
-    
-    // Build type remapping table
+    // Build type remapping table - imports first (in import order), then remaining functions
     int new_type_idx = 0;
     int out_type_count = 0;
-    for (int i = 0; i < type_count; ++i)
+    
+    // First pass: imports in order (this ensures type indices are 0, 1, 2... in import order)
+    for (int i = 0; i < out_import_count; ++i)
     {
-        if (type_used[i])
+        int t = func_type[i];
+        if (t >= 0 && t < MAX_TYPES && !type_used[t])
         {
-            type_new_idx[i] = new_type_idx++;
+            type_used[t] = 1;
+            type_new_idx[t] = new_type_idx++;
             out_type_count++;
         }
-        else
+    }
+    
+    // Second pass: remaining non-deleted functions
+    for (int i = out_import_count; i < out_import_count + func_count; ++i)
+    {
+        if (func_to_delete[i])
+            continue;  // skip deleted functions
+        int t = func_type[i];
+        if (t >= 0 && t < MAX_TYPES && !type_used[t])
         {
-            type_new_idx[i] = -1;  // mark as deleted
-            if (DEBUG)
-                fprintf(stderr, "Deleting unused type %d\n", i);
+            type_used[t] = 1;
+            type_new_idx[t] = new_type_idx++;
+            out_type_count++;
         }
     }
     
@@ -627,33 +629,52 @@ int cleaner (
 
             case 0x01U: // type section
             {
-                // output type section, skipping unused types
+                // output type section in import order (matching type_new_idx order)
+                ADVANCE(section_len);  // skip input type section
+
                 *o++ = 0x01U;
                 
                 uint8_t temp_buf[4096];
                 uint8_t* temp = temp_buf;
                 leb_out(out_type_count, &temp);
                 
-                int input_type_count = LEB();
-                for (int i = 0; i < input_type_count; ++i)
+                // Track which types have been written
+                uint8_t written[MAX_TYPES];
+                memset(written, 0, MAX_TYPES);
+                
+                // Write types in import order first
+                for (int i = 0; i < out_import_count; ++i)
                 {
-                    uint8_t* type_start = w;
-                    REQUIRE(1);
-                    ADVANCE(1);  // 0x60
-                    int pc = LEB();  // param count
-                    for (int j = 0; j < pc; ++j) LEB();
-                    int rc = LEB();  // result count
-                    for (int j = 0; j < rc; ++j) LEB();
-                    
-                    if (type_used[i])
+                    int t = func_type[i];
+                    if (t >= 0 && t < MAX_TYPES && !written[t] && types[t].set)
                     {
-                        // Check bounds before copying
-                        if (temp - temp_buf + (w - type_start) > (ssize_t)sizeof(temp_buf))
-                        {
-                            return fprintf(stderr, "Type section too large (>4KB)\n");
-                        }
-                        memcpy(temp, type_start, w - type_start);
-                        temp += (w - type_start);
+                        written[t] = 1;
+                        *temp++ = 0x60U;
+                        leb_out(types[t].pc, &temp);
+                        for (int j = 0; j < types[t].pc; ++j)
+                            leb_out(types[t].p[j], &temp);
+                        leb_out(types[t].rc, &temp);
+                        for (int j = 0; j < types[t].rc; ++j)
+                            leb_out(types[t].r[j], &temp);
+                    }
+                }
+                
+                // Write remaining types for non-deleted functions
+                for (int i = out_import_count; i < out_import_count + func_count; ++i)
+                {
+                    if (func_to_delete[i])
+                        continue;
+                    int t = func_type[i];
+                    if (t >= 0 && t < MAX_TYPES && !written[t] && types[t].set)
+                    {
+                        written[t] = 1;
+                        *temp++ = 0x60U;
+                        leb_out(types[t].pc, &temp);
+                        for (int j = 0; j < types[t].pc; ++j)
+                            leb_out(types[t].p[j], &temp);
+                        leb_out(types[t].rc, &temp);
+                        for (int j = 0; j < types[t].rc; ++j)
+                            leb_out(types[t].r[j], &temp);
                     }
                 }
 
@@ -824,19 +845,39 @@ int cleaner (
                 // vec len
                 *o++ = (func_cbak == -1 ? 0x01U : 0x02U);
     
-                // write hook export (use original func_hook index)
-                *o++ = 0x04U;
-                *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
-                *o++ = 0x00U;
-                leb_out(func_hook, &o);
+                // Determine order: cbak first if cbak index < hook index
+                int cbak_first = (func_cbak != -1 && func_cbak < func_hook);
 
-                // write cbak export if present (use original func_cbak index)
-                if (func_cbak != -1)
+                if (cbak_first)
                 {
+                    // write cbak export first
                     *o++ = 0x04U;
                     *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
                     *o++ = 0x00U;
                     leb_out(func_cbak, &o);
+                    
+                    // write hook export second
+                    *o++ = 0x04U;
+                    *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
+                    *o++ = 0x00U;
+                    leb_out(func_hook, &o);
+                }
+                else
+                {
+                    // write hook export first
+                    *o++ = 0x04U;
+                    *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
+                    *o++ = 0x00U;
+                    leb_out(func_hook, &o);
+
+                    // write cbak export if present
+                    if (func_cbak != -1)
+                    {
+                        *o++ = 0x04U;
+                        *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
+                        *o++ = 0x00U;
+                        leb_out(func_cbak, &o);
+                    }
                 }
 
                 ADVANCE(section_len);
