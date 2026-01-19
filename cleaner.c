@@ -1124,7 +1124,7 @@ int cleaner (
                                 uint8_t* ptr = w - 1;
                                 uint8_t* fptr = w;
                                 uint64_t f = LEB();
-                                
+
                                 // remap function index if it's a non-import function
                                 uint64_t new_f = f;
                                 if (f >= (uint64_t)out_import_count && f < MAX_FUNCS)
@@ -1142,16 +1142,14 @@ int cleaner (
                                     RESET_GUARD_FINDER()
                                 else
                                     call_guard_found = ptr;
-                                
-                                // track size change due to remapping
-                                int old_leb = leb_size(f);
-                                int new_leb = leb_size(new_f);
-                                guard_rewrite_bytes += (new_leb - old_leb);
-                                
-                                // write call instruction with remapped index
+
+                                // preserve original LEB128 size
+                                int original_leb_size = w - fptr;
+
+                                // write call instruction with remapped index, preserving original size
                                 uint8_t* out_call_start = o;
                                 *o++ = 0x10U;
-                                leb_out(new_f, &o);
+                                leb_out_pad(new_f, &o, original_leb_size);
                                 if (new_f == (uint64_t)guard_func_idx)
                                 {
                                     call_guard_found_out = out_call_start;
