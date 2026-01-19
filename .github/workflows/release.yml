@@ -90,6 +90,11 @@ jobs:
           fi
           make
 
+      - name: Run tests
+        working-directory: tests
+        run: |
+          ./run-all.sh
+
       - name: Determine binary name
         id: binary_name
         run: |
