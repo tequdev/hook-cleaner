@@ -2,15 +2,13 @@
   (type (;0;) (func (param i32 i32) (result i32)))
   (type (;1;) (func (param i32 i32 i32 i32) (result i64)))
   (type (;2;) (func (param i32 i32 i64) (result i64)))
-  (type (;3;) (func))
-  (type (;4;) (func (param i32) (result i64)))
+  (type (;3;) (func (param i32) (result i64)))
   (import "env" "_g" (func (;0;) (type 0)))
   (import "env" "state" (func (;1;) (type 1)))
   (import "env" "trace_num" (func (;2;) (type 2)))
   (import "env" "rollback" (func (;3;) (type 2)))
   (import "env" "accept" (func (;4;) (type 2)))
-  (func (;5;) (type 3))
-  (func (;6;) (type 4) (param i32) (result i64)
+  (func (;5;) (type 3) (param i32) (result i64)
     (local i32 i32 i32 i64)
     global.get 0
     local.set 1
@@ -27,7 +25,7 @@
     i32.store offset=12
     local.get 4
     return)
-  (func (;7;) (type 4) (param i32) (result i64)
+  (func (;6;) (type 3) (param i32) (result i64)
     (local i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32 i32 i32 i32 i32 i64 i64 i64 i64 i32 i32 i32 i32 i32 i64 i64 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i64 i32 i32 i32 i32 i32)
     global.get 0
     local.set 1
@@ -396,6 +394,6 @@
   (global (;2;) i32 (i32.const 1024))
   (global (;3;) i32 (i32.const 66672))
   (global (;4;) i32 (i32.const 1024))
-  (export "hook" (func 7))
-  (export "cbak" (func 6))
+  (export "cbak" (func 5))
+  (export "hook" (func 6))
   (data (;0;) (i32.const 1024) "hello world!\00state call failed\00hook state did not match expected value\00hook state matched expected value\00"))

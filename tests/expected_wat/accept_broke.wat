@@ -2,13 +2,11 @@
   (type (;0;) (func (param i32 i32 i32 i32 i32) (result i64)))
   (type (;1;) (func (param i32 i32 i64) (result i64)))
   (type (;2;) (func (param i32 i32) (result i32)))
-  (type (;3;) (func))
-  (type (;4;) (func (param i32) (result i64)))
+  (type (;3;) (func (param i32) (result i64)))
   (import "env" "trace" (func (;0;) (type 0)))
   (import "env" "accept" (func (;1;) (type 1)))
   (import "env" "_g" (func (;2;) (type 2)))
-  (func (;3;) (type 3))
-  (func (;4;) (type 4) (param i32) (result i64)
+  (func (;3;) (type 3) (param i32) (result i64)
     (local i32 i32 i32 i64)
     global.get 0
     local.set 1
@@ -25,7 +23,7 @@
     local.set 4
     local.get 4
     return)
-  (func (;5;) (type 4) (param i32) (result i64)
+  (func (;4;) (type 3) (param i32) (result i64)
     (local i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i32 i64 i32 i32)
     global.get 0
     local.set 1
@@ -92,6 +90,6 @@
   (global (;4;) i32 (i32.const 66608))
   (global (;5;) i32 (i32.const 0))
   (global (;6;) i32 (i32.const 1))
-  (export "hook" (func 5))
-  (export "cbak" (func 4))
+  (export "cbak" (func 3))
+  (export "hook" (func 4))
   (data (;0;) (i32.const 1024) "Accept.c: Called.\00\22Accept.c: Called.\22\00"))
