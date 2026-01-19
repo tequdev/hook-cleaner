@@ -62,6 +62,17 @@ void leb_out(
 }
 
 
+// Calculate the size of a LEB128 encoding
+int leb_size(uint64_t val)
+{
+    int size = 0;
+    do {
+        size++;
+        val >>= 7;
+    } while (val != 0);
+    return size;
+}
+
 void leb_out_pad(
     uint64_t i,
     uint8_t** o,
@@ -177,6 +188,16 @@ int cleaner (
     int func_count = -1;
     int hook_cbak_type = -1;
     int func_type[MAX_FUNCS];    // each function we discover import/func has its type id recorded here
+    
+    // Dead code elimination: track functions to delete (exported with __ prefix)
+    int func_to_delete[MAX_FUNCS];   // 1 = delete this function, 0 = keep
+    int func_new_idx[MAX_FUNCS];     // mapping from old index to new index
+    int deleted_func_count = 0;       // number of deleted functions (non-import only)
+    
+    // Type elimination: track unused types
+    int type_used[MAX_TYPES];        // 1 = type is used, 0 = can be deleted
+    int type_new_idx[MAX_TYPES];     // mapping from old type index to new type index
+    int type_count = 0;
     struct {
         uint8_t set;
         uint8_t rc;
@@ -189,6 +210,14 @@ int cleaner (
     {
         func_type[x] = -1;
         types[x].set = 0;
+        type_used[x] = 0;
+        type_new_idx[x] = x;  // initially identity mapping
+    }
+    
+    for (int x = 0; x < MAX_FUNCS; ++x)
+    {
+        func_to_delete[x] = 0;
+        func_new_idx[x] = x;  // initially identity mapping
     }
 
     int guard_func_idx = -1;
@@ -220,7 +249,7 @@ int cleaner (
         {
             case 0x01U: // types
             {
-                int type_count = LEB();
+                type_count = LEB();
                 for (int i = 0; i < type_count; ++i)
                 {
                     REQUIRE(1);
@@ -383,7 +412,7 @@ int cleaner (
                     // since we have to parse name first we'll read it in passing
                     // and store info about it here
                     int status = 0; // 1 = hook() 2 = cbak(), 0 = irrelevant
-                    
+
                     // read export name
                     uint64_t export_name_len = LEB();
                     REQUIRE(export_name_len);
@@ -395,6 +424,7 @@ int cleaner (
                         if (w[0] == 'c' && w[1] == 'b' && w[2] == 'a' && w[3] == 'k')
                             status = 2;
                     }
+
                     ADVANCE(export_name_len);
                     
                     // export type
@@ -409,9 +439,16 @@ int cleaner (
                         func_hook = export_idx;
                     else if (status == 2)
                         func_cbak = export_idx;
-
-                    if (func_hook > -1 && func_cbak > -1)
-                        break;
+                    else if (status == 0 && export_type == 0x00U)
+                    {
+                        // function export that is not hook/cbak - mark for deletion
+                        if (export_idx < MAX_FUNCS)
+                        {
+                            func_to_delete[export_idx] = 1;
+                            if (DEBUG)
+                                fprintf(stderr, "Marking func %ld for deletion (non-hook/cbak export)\n", export_idx);
+                        }
+                    }
                 }
 
                 // hook() is required at minimum
@@ -433,8 +470,8 @@ int cleaner (
 
                     ADVANCE(code_size);
 
-                    if (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count))
-                        out_code_size += (w - code_start);
+                    // include all functions (not just hook/cbak) to preserve helper functions
+                    out_code_size += (w - code_start);
     
                 }
                 continue;
@@ -460,6 +497,70 @@ int cleaner (
     if (guard_func_idx == -1)
         return fprintf(stderr, "Guard function _g was not imported / missing.\n");
 
+    // Build remapping table for function indices
+    // Only non-import functions can be deleted
+    int new_idx = out_import_count;
+    for (int i = out_import_count; i < out_import_count + func_count; ++i)
+    {
+        if (func_to_delete[i])
+        {
+            func_new_idx[i] = -1;  // mark as deleted
+            deleted_func_count++;
+            if (DEBUG)
+                fprintf(stderr, "Deleting func %d\n", i);
+        }
+        else
+        {
+            func_new_idx[i] = new_idx++;
+            if (DEBUG)
+                fprintf(stderr, "Remapping func %d -> %d\n", i, func_new_idx[i]);
+        }
+    }
+    
+    // Remap hook and cbak indices
+    if (func_hook >= out_import_count)
+        func_hook = func_new_idx[func_hook];
+    if (func_cbak >= out_import_count)
+        func_cbak = func_new_idx[func_cbak];
+    
+    if (DEBUG)
+        fprintf(stderr, "After remapping: hook idx: %d, cbak idx: %d, deleted: %d\n", 
+                func_hook, func_cbak, deleted_func_count);
+
+    // Build type remapping table - imports first (in import order), then remaining functions
+    int new_type_idx = 0;
+    int out_type_count = 0;
+    
+    // First pass: imports in order (this ensures type indices are 0, 1, 2... in import order)
+    for (int i = 0; i < out_import_count; ++i)
+    {
+        int t = func_type[i];
+        if (t >= 0 && t < MAX_TYPES && !type_used[t])
+        {
+            type_used[t] = 1;
+            type_new_idx[t] = new_type_idx++;
+            out_type_count++;
+        }
+    }
+    
+    // Second pass: remaining non-deleted functions
+    for (int i = out_import_count; i < out_import_count + func_count; ++i)
+    {
+        if (func_to_delete[i])
+            continue;  // skip deleted functions
+        int t = func_type[i];
+        if (t >= 0 && t < MAX_TYPES && !type_used[t])
+        {
+            type_used[t] = 1;
+            type_new_idx[t] = new_type_idx++;
+            out_type_count++;
+        }
+    }
+    
+    // Adjust out_code_size by subtracting deleted function code sizes
+    // (will be calculated in pass 2)
+    int out_func_count = func_count - deleted_func_count;
+
     // reset to top
     w = wstart;
 
@@ -474,8 +575,7 @@ int cleaner (
     for (int i = 0; i < 8; ++i)
         *o++ = *w++;
 
-    int type_new[MAX_TYPES];
-    memset(type_new, 0, sizeof(type_new));
+    // type_new array removed - no longer remapping types
 
     next_section_start = 0;
 
@@ -529,100 +629,59 @@ int cleaner (
 
             case 0x01U: // type section
             {
-                ADVANCE(section_len);
+                // output type section in import order (matching type_new_idx order)
+                ADVANCE(section_len);  // skip input type section
 
-                *o++ = 0x01U;   // write section type
-
-                uint8_t used[MAX_TYPES];
-                memset(used, 0, MAX_TYPES);
-
-                // count types
-                int type_count = 0;
-                int imports_use_hook_cbak_type = 0;
-                int section_size = 0;
-                for (int i = 0; i < out_import_count; ++i)
-                {
-                    if (!used[func_type[i]])
-                    {
-                        type_count++;
-                        used[func_type[i]] = 1;
-                        section_size += 3U + types[func_type[i]].rc + types[func_type[i]].pc;
-                        if (func_type[i] == hook_cbak_type && !imports_use_hook_cbak_type)
-                        {
-                            imports_use_hook_cbak_type = 1;
-                            hook_cbak_type = type_count-1;
-                            if (DEBUG)
-                                fprintf(stderr, "Imports DO use hook_cbak_type = %d\n", hook_cbak_type);
-                        }
-                    }
-                }
+                *o++ = 0x01U;
                 
-                if (!imports_use_hook_cbak_type)
-                {
-                    hook_cbak_type = type_count++;
-                    section_size += 5U;
-                    if (DEBUG)
-                        fprintf(stderr, "Imports do not use hook_cbak_type = %d\n", hook_cbak_type);
-                }
+                uint8_t temp_buf[4096];
+                uint8_t* temp = temp_buf;
+                leb_out(out_type_count, &temp);
                 
-                if (type_count > 127*127)
-                    return fprintf(stderr, "Too many types in wasm!\n");
-
-                // account for the type vector size bytes
-                section_size += (type_count > 127 ? 2U : 1U);
-
-                if (DEBUG)
-                    fprintf(stderr, "Writing type section, proposed size: %d\n", section_size);
-                // write out section size
-                leb_out(section_size, &o);
-
-
-                uint8_t* out_start = o;
-
-                // write type vector len
-                leb_out(type_count, &o);
-
-                // write out types
-                memset(used, 0, MAX_TYPES);
-                int upto = 0;
+                // Track which types have been written
+                uint8_t written[MAX_TYPES];
+                memset(written, 0, MAX_TYPES);
+                
+                // Write types in import order first
                 for (int i = 0; i < out_import_count; ++i)
                 {
                     int t = func_type[i];
-                    if (!types[t].set)
-                        return fprintf(stderr, "Tried to write unset type %d from func %d\n", func_type[i], i);
-                    
-
-                    if (used[t])
-                        continue;
-                    used[t] = 1;
-
-                    *o++ = 0x60U;   // functype lead in byte
-                    // write parameter count
-                    leb_out(types[t].pc, &o);
-                    // write each parameter type
-                    for (int j = 0; j < types[t].pc; ++j)
-                        leb_out(types[t].p[j], &o);
+                    if (t >= 0 && t < MAX_TYPES && !written[t] && types[t].set)
+                    {
+                        written[t] = 1;
+                        *temp++ = 0x60U;
+                        leb_out(types[t].pc, &temp);
+                        for (int j = 0; j < types[t].pc; ++j)
+                            leb_out(types[t].p[j], &temp);
+                        leb_out(types[t].rc, &temp);
+                        for (int j = 0; j < types[t].rc; ++j)
+                            leb_out(types[t].r[j], &temp);
+                    }
+                }
                 
-                    leb_out(types[t].rc, &o);
-                    for (int j = 0; j < types[t].rc; ++j)
-                        leb_out(types[t].r[j], &o);
-
-                    type_new[t] = upto++;
-                    // done for this record
-                }
-
-                // write out cbak/hook type if needed
-                if (!imports_use_hook_cbak_type)
+                // Write remaining types for non-deleted functions
+                for (int i = out_import_count; i < out_import_count + func_count; ++i)
                 {
-                    *o++ = 0x60U;
-                    *o++ = 0x01U;
-                    *o++ = 0x7FU;
-                    *o++ = 0x01U;
-                    *o++ = 0x7EU;
+                    if (func_to_delete[i])
+                        continue;
+                    int t = func_type[i];
+                    if (t >= 0 && t < MAX_TYPES && !written[t] && types[t].set)
+                    {
+                        written[t] = 1;
+                        *temp++ = 0x60U;
+                        leb_out(types[t].pc, &temp);
+                        for (int j = 0; j < types[t].pc; ++j)
+                            leb_out(types[t].p[j], &temp);
+                        leb_out(types[t].rc, &temp);
+                        for (int j = 0; j < types[t].rc; ++j)
+                            leb_out(types[t].r[j], &temp);
+                    }
                 }
 
-                if (DEBUG)
-                    fprintf(stderr, "Actually written type section size: %ld\n", o - out_start);
+                ssize_t type_section_size = temp - temp_buf;
+                leb_out(type_section_size, &o);
+                memcpy(o, temp_buf, type_section_size);
+                o += type_section_size;
                 continue;
             }
 
@@ -640,7 +699,7 @@ int cleaner (
                 uint8_t* import_start = o;
                 leb_out(out_import_count, &o);
 
-                int type_count = 0;
+                int func_import_idx = 0;
                 
                 int count = LEB();
                 for (int i = 0; i < count; ++i)
@@ -705,11 +764,13 @@ int cleaner (
                     // write import type (always 0)
                     *o++ = 0x00U;
 
+                    // remap type index
+                    int new_type = type_new_idx[func_type[func_import_idx]];
                     if (DEBUG)
-                        fprintf(stderr, "New import: %d old type: %d new type: %d\n", i, func_type[i], type_new[func_type[i]]);
+                        fprintf(stderr, "New import: %d type: %d -> %d\n", func_import_idx, func_type[func_import_idx], new_type);
 
-                    // write new type idx
-                    leb_out(type_new[func_type[i]], &o);
+                    leb_out(new_type, &o);
+                    func_import_idx++;
 
                     LEB(); // discard old type
                     // advance to next entry
@@ -723,32 +784,34 @@ int cleaner (
 
             case 0x03U: // functions
             {
+                // output function section, skipping deleted functions and remapping type indices
                 *o++ = 0x03U;
                 
-
-                ssize_t s = (func_cbak == -1 ? 0x01U : 0x02U);
-                if (hook_cbak_type > 127U*127U)
-                    return fprintf(stderr, "Illegally large hook_cbak type index\n");
-                if (hook_cbak_type > 127U)
-                    s <<= 1U;   // double size if > 127
-                s++;            // one byte for the vector size
-                if (DEBUG)
-                    fprintf(stderr, "Writing function section, proposed size: %ld\n", s);
-
-                leb_out(s, &o); // sections size
-                uint8_t* function_start = o;
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U);   // vector size
-                leb_out(hook_cbak_type, &o);    // vector entries
-                if (func_cbak != -1)
+                uint64_t input_func_count = LEB();
+                
+                // calculate output section size
+                uint8_t temp_buf[MAX_FUNCS * 3];  // worst case: 3 bytes per LEB
+                uint8_t* temp = temp_buf;
+                leb_out(out_func_count, &temp);
+                
+                for (uint64_t i = 0; i < input_func_count; ++i)
                 {
-                    leb_out(hook_cbak_type, &o);
-                    if (DEBUG)
-                        fprintf(stderr, "Writing cbak [idx=%d, type=%d]\n", func_cbak, hook_cbak_type);
+                    int func_idx = out_import_count + i;
+                    uint64_t type_idx = LEB();
+                    
+                    if (!func_to_delete[func_idx])
+                    {
+                        // remap type index
+                        int new_type = type_new_idx[type_idx];
+                        leb_out(new_type, &temp);
+                    }
                 }
-                ADVANCE(section_len);
-
-                if (DEBUG)
-                    fprintf(stderr, "Actually written function size: %ld\n", o - function_start);
+                
+                ssize_t func_section_size = temp - temp_buf;
+                leb_out(func_section_size, &o);
+                memcpy(o, temp_buf, func_section_size);
+                o += func_section_size;
+                
                 continue;
             }
 
@@ -767,40 +830,53 @@ int cleaner (
             {
                 *o++ = 0x07U;
                 
-                // size
-                // V M NNNN 0 1 [ M NNNN 0 2 ]
-                *o++ = (func_cbak == -1 ? 0x08U : 0x0FU);
+                // calculate section size dynamically (original func indices may be > 127)
+                // format: vec_len + (name_len + name + type + idx) * n
+                int hook_leb_size = leb_size(func_hook);
+                int cbak_leb_size = leb_size(func_cbak);
+                
+                // vec_len(1) + hook_export(1+4+1+hook_leb) [+ cbak_export(1+4+1+cbak_leb)]
+                int export_section_size = 1 + 6 + hook_leb_size;
+                if (func_cbak != -1)
+                    export_section_size += 6 + cbak_leb_size;
+                
+                leb_out(export_section_size, &o);
 
                 // vec len
                 *o++ = (func_cbak == -1 ? 0x01U : 0x02U);
     
-                int cbak_first = (func_cbak < func_hook);
+                // Determine order: cbak first if cbak index < hook index
+                int cbak_first = (func_cbak != -1 && func_cbak < func_hook);
 
-                if (cbak_first && func_cbak != -1)
+                if (cbak_first)
                 {
+                    // write cbak export first
                     *o++ = 0x04U;
                     *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
                     *o++ = 0x00U;
-                    leb_out(out_import_count + 0, &o);
+                    leb_out(func_cbak, &o);
                     
+                    // write hook export second
                     *o++ = 0x04U;
                     *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
                     *o++ = 0x00U;
-                    leb_out(out_import_count + 1, &o);
+                    leb_out(func_hook, &o);
                 }
                 else
                 {
+                    // write hook export first
                     *o++ = 0x04U;
                     *o++ = 'h'; *o++ = 'o'; *o++ = 'o'; *o++ = 'k';
                     *o++ = 0x00U;
-                    leb_out(out_import_count + 0, &o);
+                    leb_out(func_hook, &o);
 
+                    // write cbak export if present
                     if (func_cbak != -1)
                     {
                         *o++ = 0x04U;
                         *o++ = 'c'; *o++ = 'b'; *o++ = 'a'; *o++ = 'k';
                         *o++ = 0x00U;
-                        leb_out(out_import_count + 1, &o);
+                        leb_out(func_cbak, &o);
                     }
                 }
 
@@ -812,8 +888,12 @@ int cleaner (
             {
                 *o++ = 0x0AU;
 
+                // calculate vec len LEB size for out_func_count (after deletions)
+                int vec_len_size = (out_func_count <= 127 ? 1 : (out_func_count <= 16383 ? 2 : 3));
+
                 if (DEBUG)
-                    fprintf(stderr, "Output code size: %ld\n", out_code_size + 1);
+                    fprintf(stderr, "Output code size: %ld (vec_len_size=%d, out_func_count=%d)\n", 
+                            out_code_size + vec_len_size, vec_len_size, out_func_count);
 
     
                 // RH NOTE:
@@ -823,21 +903,35 @@ int cleaner (
                 // original size of the hook will be inserted at the start of the relevant loop. This counter tracks
                 // these, and the reserved space allows us to output the right LEB128 at the end.
                 int total_guard_rewrite_bytes = 0;
+                // Track bytes saved from deleted functions
+                int total_deleted_bytes = 0;
                 uint8_t* codesec_out_size_ptr = o;
 
 
 
                 // we need to correct this at the end
-                leb_out_pad(out_code_size + 1 /* allow for vec len */, &o, 3);
+                leb_out_pad(out_code_size + vec_len_size /* allow for vec len */, &o, 3);
 
-                *o++ = (func_cbak == -1 ? 0x01U : 0x02U); // vec len
+                leb_out(out_func_count, &o); // vec len (only non-deleted functions)
 
                 uint64_t count = LEB();
                 for (uint64_t i = 0; i < count; ++i)
                 {
+                    int func_idx = out_import_count + i;  // actual function index
                     uint8_t* code_start = w;
                     uint64_t code_size = LEB();
-                    if (i == (func_hook - out_import_count) || i == (func_cbak - out_import_count))
+                    
+                    // skip deleted functions
+                    if (func_to_delete[func_idx])
+                    {
+                        total_deleted_bytes += (w - code_start) + code_size;
+                        ADVANCE(code_size);
+                        if (DEBUG)
+                            fprintf(stderr, "Skipping deleted func %d\n", func_idx);
+                        continue;
+                    }
+                    
+                    // process this function
                     {
 
                         //leb_out(code_size, &o);
@@ -884,20 +978,28 @@ int cleaner (
 
                         int i32_found = 0;
                         uint8_t* call_guard_found = 0;
+                        uint8_t* call_guard_found_out = 0;
+                        uint8_t* call_guard_end_out = 0;
                         uint8_t* last_i32 = 0;
                         uint64_t last_i32_actual = 0;   // the actual leb value 
                         uint8_t* second_last_i32 = 0;
                         uint64_t second_last_i32_actual = 0; // the actual leb value
+                        uint8_t* last_i32_out = 0;
+                        uint8_t* second_last_i32_out = 0;
                         int between_const_and_guard = 0;
 
                         #define RESET_GUARD_FINDER()\
                         {\
                             i32_found = 0;\
                             call_guard_found = 0;\
+                            call_guard_found_out = 0;\
+                            call_guard_end_out = 0;\
                             last_i32 = 0;\
                             last_i32_actual = 0;\
                             second_last_i32 = 0;\
                             second_last_i32_actual = 0;\
+                            last_i32_out = 0;\
+                            second_last_i32_out = 0;\
                             between_const_and_guard = 0;\
                         }
 
@@ -995,13 +1097,19 @@ int cleaner (
 
                                         // erase guard call with nops and an additional drop
                                         // to preserve the stack at this location during runtime
-                                        int bytes_to_fill = w - call_guard_found - 2;
-                                        *call_guard_found = 0x1AU;                      // drop
+                                        if (!call_guard_found_out || !call_guard_end_out)
+                                        {
+                                            return fprintf(stderr, "Guard erasure attempted without output tracking at offset %ld\n",
+                                                    w - wstart);
+                                        }
+                                        int bytes_to_fill = (int)(call_guard_end_out - call_guard_found_out) - 1;
+                                        *call_guard_found_out = 0x1AU;              // drop
                                         while (bytes_to_fill-- > 0)
-                                            *(++call_guard_found) = 0x01U;              // nop
+                                            *(++call_guard_found_out) = 0x01U;      // nop
 
-                                        // first move the instructions down
-                                        memcpy(last_loop_out + guard_len, last_loop, rest_len);
+                                        // first move the existing output down
+                                        ssize_t out_tail_len = o - last_loop_out;
+                                        memmove(last_loop_out + guard_len, last_loop_out, out_tail_len);
 
                                         // then copy the guard into position
                                         memcpy(last_loop_out, guard_code, guard_len);
@@ -1017,8 +1125,8 @@ int cleaner (
                                     }
                                     else
                                     {
-                                        ssize_t guard_len = w - second_last_i32;
-                                        ssize_t rest_len = second_last_i32 - last_loop;
+                                        ssize_t guard_len = o - second_last_i32_out;
+                                        ssize_t rest_len = second_last_i32_out - last_loop_out;
                                         fprintf(stderr, "Found clean guard at: %ld [0x%lx] - %ld [0x%lx], "
                                                 "moving to %ld [0x%lx] - %ld [0x%lx]\n", 
                                                 second_last_i32 - wstart,
@@ -1031,11 +1139,17 @@ int cleaner (
                                                 last_loop - wstart + guard_len
                                             );
 
-                                        // first move the instructions down
-                                        memcpy(last_loop_out + guard_len, last_loop, rest_len);
+                                        uint8_t guard_code[128];
+                                        if (guard_len > (ssize_t)sizeof(guard_code))
+                                            return fprintf(stderr, "Guard sequence too large (%ld bytes)\n", guard_len);
+                                        
+                                        memcpy(guard_code, second_last_i32_out, guard_len);
+
+                                        // first move the existing output down
+                                        memmove(last_loop_out + guard_len, last_loop_out, rest_len);
 
                                         // then copy the guard into position
-                                        memcpy(last_loop_out, second_last_i32, guard_len);
+                                        memcpy(last_loop_out, guard_code, guard_len);
 
                                         // prevent moving a second guard here if somehow there is one
                                         last_loop = 0;
@@ -1049,13 +1163,39 @@ int cleaner (
                             {
                                 REQUIRE(1);
                                 uint8_t* ptr = w - 1;
+                                uint8_t* fptr = w;
                                 uint64_t f = LEB();
-                                if (f != guard_func_idx)
+
+                                // remap function index if it's a non-import function
+                                uint64_t new_f = f;
+                                if (f >= (uint64_t)out_import_count && f < MAX_FUNCS)
+                                {
+                                    new_f = func_new_idx[f];
+                                    // Check if the function was deleted
+                                    if (new_f == (uint64_t)-1)
+                                    {
+                                        return fprintf(stderr, "Call to deleted function %ld at offset %ld\n",
+                                                f, w - wstart);
+                                    }
+                                }
+
+                                if (new_f != (uint64_t)guard_func_idx)
                                     RESET_GUARD_FINDER()
                                 else
                                     call_guard_found = ptr;
-                                memcpy(o, instr_start, w-instr_start);
-                                o += (w - instr_start);
+
+                                // preserve original LEB128 size
+                                int original_leb_size = w - fptr;
+
+                                // write call instruction with remapped index, preserving original size
+                                uint8_t* out_call_start = o;
+                                *o++ = 0x10U;
+                                leb_out_pad(new_f, &o, original_leb_size);
+                                if (new_f == (uint64_t)guard_func_idx)
+                                {
+                                    call_guard_found_out = out_call_start;
+                                    call_guard_end_out = o;
+                                }
                                 continue;
                             } else                            
                             if (ins == 0x41U)                       // i32.const
@@ -1065,6 +1205,8 @@ int cleaner (
                                 last_i32 = w - 1;
 
                                 second_last_i32_actual = last_i32_actual;
+                                second_last_i32_out = last_i32_out;
+                                last_i32_out = o;
 
                                 last_i32_actual = LEB();
 
@@ -1289,29 +1431,29 @@ int cleaner (
                             uint8_t* code_size_ptr = o;
                         */
 
+                        // Calculate actual written size for this function
+                        ssize_t actual_func_size = o - (code_size_ptr + 3);
+                        
                         if (DEBUG)
-                            fprintf(stderr, "Rewriting codesec from: %ld to %ld at %ld [0x%lx]\n",
+                            fprintf(stderr, "Rewriting func size from: %ld to %ld\n",
                                     code_size,
-                                    code_size + guard_rewrite_bytes,
-                                    code_size,
-                                    code_size);
+                                    actual_func_size);
 
-                        leb_out_pad(code_size + guard_rewrite_bytes, /* 1 byte for vec len */
+                        leb_out_pad(actual_func_size,
                                 &code_size_ptr, 3);
                     }
-                    else
-                        ADVANCE(code_size);     // skip other functions
                 }
 
                 // rewrite the total size of the section
+                // calculate actual written size (from after the 3-byte padded LEB to current position)
+                ssize_t actual_code_size = o - (codesec_out_size_ptr + 3);
                 if (DEBUG)
-                    fprintf(stderr, "Rewriting codesec section from: %ld to %ld at %ld [0x%lx] \n",
-                            out_code_size + 1,
-                            out_code_size + 1 + total_guard_rewrite_bytes,
-                            out_code_size,
-                            out_code_size);
+                    fprintf(stderr, "Rewriting codesec section: actual size = %ld (deleted: %d, guard_rewrite: %d)\n",
+                            actual_code_size,
+                            total_deleted_bytes,
+                            total_guard_rewrite_bytes);
 
-                leb_out_pad(out_code_size + total_guard_rewrite_bytes + 1, /* 1 byte for vec len */
+                leb_out_pad(actual_code_size,
                         &codesec_out_size_ptr, 3);
                 continue;
             }
