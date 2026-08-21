@@ -70,7 +70,7 @@ jobs:
         run: mv hook-cleaner "${{ matrix.asset }}"
 
       - name: Verify binary architecture
-        run: ./scripts/check-binary-arch.sh "${{ matrix.asset }}" "${{ matrix.os_name }}" "${{ matrix.arch }}" "${{ matrix.libc }}"
+        run: ./.github/scripts/check-binary-arch.sh "${{ matrix.asset }}" "${{ matrix.os_name }}" "${{ matrix.arch }}" "${{ matrix.libc }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -82,7 +82,6 @@ jobs:
   build-musl:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    container: alpine:3.21
     strategy:
       fail-fast: false
       matrix:
@@ -101,31 +100,31 @@ jobs:
             name: linux-arm64-musl
 
     steps:
-      - name: Install build tools
-        shell: sh
-        run: |
-          apk add --no-cache build-base file binutils git bash gcompat libstdc++
-          apk add --no-cache wabt || true
-
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Build binary
-        run: make
-
-      - name: Run tests
+      - name: Build musl binary in Alpine
         run: |
-          if command -v wasm2wat >/dev/null 2>&1; then
-            (cd tests && ./run-all.sh)
-          else
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.21 sh -c '
+            set -eu
+            apk add --no-cache build-base file binutils
+            make
             ./hook-cleaner tests/accept.wasm /tmp/t.wasm
-          fi
+          '
+
+      - name: Fix binary ownership
+        run: sudo chown "$(id -u):$(id -g)" hook-cleaner
 
       - name: Rename binary
         run: mv hook-cleaner "${{ matrix.asset }}"
 
       - name: Verify binary architecture
-        run: ./scripts/check-binary-arch.sh "${{ matrix.asset }}" "${{ matrix.os_name }}" "${{ matrix.arch }}" "${{ matrix.libc }}"
+        run: |
+          if ! command -v file >/dev/null 2>&1 || ! command -v readelf >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends binutils file
+          fi
+          ./.github/scripts/check-binary-arch.sh "${{ matrix.asset }}" "${{ matrix.os_name }}" "${{ matrix.arch }}" "${{ matrix.libc }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
