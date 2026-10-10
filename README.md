@@ -57,6 +57,7 @@ make
 2. GitHub Actions will automatically build binaries for the following platforms:
    - **Linux**: x64 (gnu/musl), arm64 (gnu/musl), x86 (gnu/musl), arm (gnu/musl)
    - **macOS**: x64, arm64
+   - **WebAssembly**: wasm32-wasi (run with a WASI runtime such as wasmtime)
 
 3. Once the build completes, a GitHub Release will be automatically created and all binaries will be uploaded.
 
@@ -68,6 +69,7 @@ Binary names follow the format below:
   - Examples: `hook-cleaner-linux-x64-gnu`, `hook-cleaner-linux-arm64-musl`
 - macOS: `hook-cleaner-macos-{arch}`
   - Examples: `hook-cleaner-macos-x64`, `hook-cleaner-macos-arm64`
+- WebAssembly (WASI): `hook-cleaner-wasm32-wasi.wasm`
 
 ## Supported Platforms
 
@@ -83,4 +85,11 @@ Binary names follow the format below:
 | Linux | arm | musl | `hook-cleaner-linux-arm-musl` |
 | macOS | x64 | - | `hook-cleaner-macos-x64` |
 | macOS | arm64 | - | `hook-cleaner-macos-arm64` |
+| WASI | wasm32 | - | `hook-cleaner-wasm32-wasi.wasm` |
+
+The WASI build runs under any WASI runtime. The runtime needs access to the input and output directories, e.g. with wasmtime:
+
+```bash
+wasmtime run --dir=. hook-cleaner-wasm32-wasi.wasm input.wasm output.wasm
+```
 
