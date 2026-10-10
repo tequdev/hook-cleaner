@@ -1,7 +1,6 @@
-# Override to run a different build, e.g. HOOKCLEANER="wasmtime run --dir=. --dir=/tmp ../hook-cleaner.wasm"
-HOOKCLEANER="${HOOKCLEANER:-../hook-cleaner}"
+HOOKCLEANER=../hook-cleaner
 
-command -v ${HOOKCLEANER%% *} > /dev/null 2> /dev/null
+stat $HOOKCLEANER > /dev/null 2> /dev/null
 if [ ! "$?" -eq "0" ];
 then
     pushd ..
