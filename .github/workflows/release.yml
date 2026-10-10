@@ -133,8 +133,44 @@ jobs:
           path: ${{ matrix.asset }}
           retention-days: 1
 
+  build-wasi:
+    name: wasm32-wasi
+    runs-on: ubuntu-24.04
+    env:
+      WASI_SDK_VERSION: '34'
+      WASMTIME_VERSION: v49.0.2
+      ASSET: hook-cleaner-wasm32-wasi.wasm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wabt file
+          curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz" | tar xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasmtime-${WASMTIME_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Build wasm binary
+        run: make CC="$RUNNER_TEMP/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux/bin/clang" && mv hook-cleaner "$ASSET"
+
+      - name: Run tests
+        working-directory: tests
+        run: HOOKCLEANER="wasmtime run --dir=. --dir=/tmp ../$ASSET" ./run-all.sh
+
+      - name: Verify binary format
+        run: file "$ASSET" | grep WebAssembly
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
   create-release:
-    needs: [build, build-musl]
+    needs: [build, build-musl, build-wasi]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
