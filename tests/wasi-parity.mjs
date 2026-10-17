@@ -1,7 +1,7 @@
 // Verify the reactor-model WASI build produces byte-identical output to the native binary.
 // Usage: node tests/wasi-parity.mjs <hook-cleaner.wasm> <native hook-cleaner>
 import { readFileSync, readdirSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { WASI } from 'node:wasi';
 
@@ -23,21 +23,55 @@ const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
 wasi.initialize(instance);
 const { memory, malloc, cleaner } = instance.exports;
 
-let failed = 0;
-for (const name of readdirSync(dir).filter((n) => n.endsWith('.wasm')).sort()) {
-  const input = readFileSync(join(dir, name));
+// Hosts allocate `out` as 2*len; the canary after that bound must survive the call.
+const CANARY = Buffer.alloc(16, 0xaa);
+
+function runWasm(input) {
   const inp = malloc(input.length);
-  const out = malloc(input.length * 2);
+  const bound = input.length * 2;
+  const out = malloc(bound + CANARY.length);
   const lenPtr = malloc(4);
   new Uint8Array(memory.buffer).set(input, inp);
+  new Uint8Array(memory.buffer).set(CANARY, out + bound);
   new DataView(memory.buffer).setInt32(lenPtr, input.length, true);
-  const rc = cleaner(inp, out, lenPtr);
+  let rc;
+  try {
+    rc = cleaner(inp, out, lenPtr);
+  } catch (e) {
+    // node:wasi (returnOnExit) throws its private exit-code key from proc_exit; the code is stored under it.
+    if (typeof e !== 'symbol') throw e;
+    rc = wasi[e];
+  }
   const outLen = new DataView(memory.buffer).getInt32(lenPtr, true);
-  const got = Buffer.from(new Uint8Array(memory.buffer, out, outLen));
-  const expected = execFileSync(nativeBin, ['-', '-'], { input, stdio: ['pipe', 'pipe', 'ignore'] });
-  const ok = rc === 0 && got.equals(expected);
+  const mem = new Uint8Array(memory.buffer);
+  return {
+    rc,
+    outLen,
+    out: Buffer.from(mem.subarray(out, out + outLen)),
+    canaryOk: Buffer.from(mem.subarray(out + bound, out + bound + CANARY.length)).equals(CANARY),
+  };
+}
+
+function runNative(input) {
+  const r = spawnSync(nativeBin, ['-', '-'], { input, stdio: ['pipe', 'pipe', 'ignore'] });
+  return { rc: r.status, out: r.stdout };
+}
+
+const cases = readdirSync(dir).filter((n) => n.endsWith('.wasm')).sort()
+  .map((name) => ({ name, input: readFileSync(join(dir, name)) }));
+// Rejected inputs: cleaner() returns non-zero for a bad magic number, and exit(100)s (proc_exit)
+// on a LEB128 overflow. The exit case runs last because libc has torn down after exit().
+cases.push({ name: 'reject: bad magic', input: Buffer.from('not a wasm file'), rejected: true });
+cases.push({ name: 'reject: LEB128 overflow', input: Buffer.from('0061736d0100000000' + 'ff'.repeat(16), 'hex'), rejected: true });
+
+let failed = 0;
+for (const { name, input, rejected } of cases) {
+  const w = runWasm(input);
+  const n = runNative(input);
+  const ok = w.rc === n.rc && (n.rc !== 0) === !!rejected && w.canaryOk
+    && (w.rc !== 0 || (w.outLen <= input.length * 2 && w.out.equals(n.out)));
   if (!ok) failed++;
-  console.log(`${ok ? 'PASS' : 'FAIL'} ${name} (rc=${rc}, ${input.length} -> ${outLen} bytes)`);
+  console.log(`${ok ? 'PASS' : 'FAIL'} ${name} (rc=${w.rc}, native rc=${n.rc}, ${input.length} -> ${w.outLen} bytes${w.canaryOk ? '' : ', canary clobbered'})`);
 }
 if (failed) {
   console.error(`${failed} test(s) differ from native output`);
