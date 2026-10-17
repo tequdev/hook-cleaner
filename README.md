@@ -57,6 +57,7 @@ make
 2. GitHub Actions will automatically build binaries for the following platforms:
    - **Linux**: x64 (gnu/musl), arm64 (gnu/musl), x86 (gnu/musl), arm (gnu/musl)
    - **macOS**: x64, arm64
+   - **WebAssembly**: wasm32-wasip1 reactor module for embedding (see below)
 
 3. Once the build completes, a GitHub Release will be automatically created and all binaries will be uploaded.
 
@@ -68,6 +69,7 @@ Binary names follow the format below:
   - Examples: `hook-cleaner-linux-x64-gnu`, `hook-cleaner-linux-arm64-musl`
 - macOS: `hook-cleaner-macos-{arch}`
   - Examples: `hook-cleaner-macos-x64`, `hook-cleaner-macos-arm64`
+- WebAssembly (WASI): `hook-cleaner-wasm32-wasi.wasm`
 
 ## Supported Platforms
 
@@ -83,4 +85,6 @@ Binary names follow the format below:
 | Linux | arm | musl | `hook-cleaner-linux-arm-musl` |
 | macOS | x64 | - | `hook-cleaner-macos-x64` |
 | macOS | arm64 | - | `hook-cleaner-macos-arm64` |
+| WASI | wasm32 | - | `hook-cleaner-wasm32-wasi.wasm` |
 
+The WASI asset is not a command-line program. It is a `wasm32-wasip1` reactor module built with wasi-sdk 34 and binaryen 133, the versions pinned in `.github/workflows/release.yml` (`PATH=<binaryen-133>/bin:$PATH make hook-cleaner.wasm WASI_CLANG=<wasi-sdk-34>/bin/clang`; binaryen must be first on `PATH` because clang also runs `wasm-opt` from `PATH` at link time, and other versions build but are not byte-identical to the release asset) for embedding in hosts such as hooks-compiler and the Hooks IDE. It exports `_initialize`, `memory`, `malloc`, `free` and `cleaner(inp, out, len)`, where `len` is an `int32` in/out pointer and `out` must be allocated with twice the input size. It imports only `fd_write`, `fd_close`, `fd_seek`, `fd_prestat_get`, `fd_prestat_dir_name` and `proc_exit` from `wasi_snapshot_preview1`. See `tests/wasi-parity.mjs` for a complete usage example with `node:wasi`.
